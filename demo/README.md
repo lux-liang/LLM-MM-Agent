@@ -20,12 +20,26 @@ cp demo/frontend/.env.local.example demo/frontend/.env.local
 Edit `demo/.env`:
 
 ```env
-API_KEY=your_llm_key
-BASE_URL=https://api.minimaxi.com/anthropic
-MODEL_NAME=MiniMax-M2.7-highspeed
-AGENT_MODEL_NAME=MiniMax-M2.7-highspeed
+OPENAI_API_KEY=your_openai_key
+DEEPSEEK_API_KEY=your_deepseek_key
+BASE_URL=https://api.openai.com/v1
+DEEPSEEK_BASE_URL=https://api.deepseek.com
+MODEL_NAME=gpt-5.6-sol
+AGENT_MODEL_NAME=gpt-5.6-sol
 E2B_API_KEY=your_e2b_key
 ```
+
+To use DeepSeek V4 Pro, set `MODEL_NAME` and `AGENT_MODEL_NAME` to
+`deepseek-v4-pro`; its provider-specific key/base are selected automatically.
+The backend requires LiteLLM 1.93.0 or newer for GPT-5.6 model metadata.
+The routing rules have deterministic tests, but live OpenAI/DeepSeek calls and
+the E2B end-to-end path still require your own credentials and were not run in
+the repository's credential-free validation environment.
+
+Remote custom LLM hosts are denied unless an administrator adds their exact
+hostname to `MMAGENT_ALLOWED_LLM_HOSTS`. DNS is checked for non-global targets;
+production deployments that enable custom hosts should also enforce an egress
+proxy/firewall allowlist to close DNS-rebinding time-of-check/time-of-use gaps.
 
 Start the demo:
 
@@ -38,12 +52,9 @@ Open:
 - Frontend: http://localhost:3000
 - Backend: http://localhost:8000
 
-Default login:
-
-```text
-admin@local.dev
-admin12345
-```
+There is no default account or password. Keep registration disabled for a
+shared deployment; for local bootstrap, explicitly enable `SEED_LOCAL_ADMIN`
+and set a strong `LOCAL_ADMIN_PASSWORD`, then disable seeding again.
 
 ## Commands
 

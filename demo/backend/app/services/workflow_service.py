@@ -358,12 +358,23 @@ class WorkflowService:
         logger.warning(f"Version index {index} out of bounds for node {node_id} (count: {len(summaries)})")
         return None
 
-    async def _resolve_output_index_by_artifact(self, version_id: UUID, artifact_id: str) -> Optional[int]:
+    async def _resolve_output_index_by_artifact(
+        self,
+        project_id: str,
+        node_id: str,
+        version_id: UUID,
+        artifact_id: str,
+    ) -> Optional[int]:
         """
         [FIX] Helper to find which output index contains a specific artifact ID.
         """
         version = await self.v_repo.get(version_id)
-        if not version or not version.outputs:
+        if (
+            not version
+            or version.project_id != UUID(project_id)
+            or version.node_id != node_id
+            or not version.outputs
+        ):
             return None
             
         for idx, output in enumerate(version.outputs):
@@ -443,10 +454,18 @@ class WorkflowService:
 
         return project
 
-    async def update_project(self, project_id: str, name: Optional[str] = None, assets: Optional[Dict[str, str]] = None) -> Project:
+    async def update_project(
+        self,
+        project_id: str,
+        name: Optional[str] = None,
+        assets: Optional[Dict[str, str]] = None,
+        owner_id: Optional[str] = None,
+    ) -> Project:
         """Updates project metadata."""
         pid = UUID(project_id)
         project = await self._get_project_or_fail(pid)
+        if owner_id is not None and str(project.owner_id) != str(owner_id):
+            raise ResourceNotFoundError("Project", project_id)
         
         if name:
             project.name = name
@@ -456,9 +475,12 @@ class WorkflowService:
         await self.p_repo.save(project)
         return project
 
-    async def delete_project(self, project_id: str) -> None:
+    async def delete_project(self, project_id: str, owner_id: Optional[str] = None) -> None:
         """Deletes a project."""
         pid = UUID(project_id)
+        project = await self._get_project_or_fail(pid)
+        if owner_id is not None and str(project.owner_id) != str(owner_id):
+            raise ResourceNotFoundError("Project", project_id)
         success = await self.p_repo.delete(pid)
         if not success:
             raise ResourceNotFoundError("Project", project_id)
@@ -755,7 +777,11 @@ class WorkflowService:
 
         # 1. Load Base Version (The Source)
         base_version = await self.v_repo.get(base_version_id)
-        if not base_version:
+        if (
+            not base_version
+            or base_version.project_id != pid
+            or base_version.node_id != node_id
+        ):
             raise ResourceNotFoundError("NodeVersion", str(base_version_id))
 
         # 2. Construct Payload for New Draft
@@ -833,6 +859,10 @@ class WorkflowService:
                 target_version = await self.v_repo.get(version_id, session=session)
                 
                 if not node_state or not target_version:
+                    raise ResourceNotFoundError("Node/Version", f"{node_id}/{version_id}")
+                if target_version.project_id != pid or target_version.node_id != node_id:
+                    # Return the same not-found shape to avoid disclosing a
+                    # cross-project version identifier.
                     raise ResourceNotFoundError("Node/Version", f"{node_id}/{version_id}")
 
                 # Update Pointers

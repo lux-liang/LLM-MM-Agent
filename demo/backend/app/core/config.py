@@ -3,6 +3,8 @@ Configuration management using Pydantic Settings.
 
 Centralizes all configuration from environment variables with sensible defaults.
 """
+import secrets
+import warnings
 from typing import List, Union
 from pydantic import AnyHttpUrl, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
@@ -13,20 +15,26 @@ class Settings(BaseSettings):
     PROJECT_NAME: str = "MM-Agent Open Local Service"
     API_PREFIX: str = "/api/v1"
     DEBUG: bool = False
+    ENVIRONMENT: str = "development"
     OPEN_SOURCE_LOCAL_MODE: bool = True
     
     # Security
-    SECRET_KEY: str = "dev_secret_key_change_me_in_production"
+    # Empty by design: local development receives an ephemeral random key;
+    # staging/production must provide a persistent SECRET_KEY via the env.
+    SECRET_KEY: str = ""
     ACCESS_TOKEN_EXPIRE_MINUTES: int = 60 * 24 * 7  # 7 days
     ALGORITHM: str = "HS256"
-    CORS_ORIGINS: List[Union[str, AnyHttpUrl]] = ["*"]
+    CORS_ORIGINS: List[Union[str, AnyHttpUrl]] = [
+        "http://localhost:3000",
+        "http://127.0.0.1:3000",
+    ]
     
     # Local Auth Defaults
-    ALLOW_PUBLIC_REGISTRATION: bool = True
+    ALLOW_PUBLIC_REGISTRATION: bool = False
     REQUIRE_INVITE_CODE: bool = False
-    SEED_LOCAL_ADMIN: bool = True
+    SEED_LOCAL_ADMIN: bool = False
     LOCAL_ADMIN_EMAIL: str = "admin@local.dev"
-    LOCAL_ADMIN_PASSWORD: str = "admin12345"
+    LOCAL_ADMIN_PASSWORD: str = ""
 
     # Infrastructure
     DATABASE_URL: str = "sqlite+aiosqlite:///./runtime/mmagent.db"
@@ -44,10 +52,12 @@ class Settings(BaseSettings):
     DB_POOL_RECYCLE: int = 3600
 
     STORAGE_ROOT: str = "runtime/storage/blobs"
+    MAX_ASSET_DOWNLOAD_BYTES: int = 100 * 1024 * 1024
     TEMPLATE_ROOT: str = "app/templates"  # Relative to backend/ directory
     
     # External API Keys (Inject via Environment)
     OPENAI_API_KEY: str = ""
+    DEEPSEEK_API_KEY: str = ""
     E2B_API_KEY: str = ""
     ANTHROPIC_API_KEY: str = ""
     TAVILY_API_KEY: str = ""
@@ -110,12 +120,17 @@ class Settings(BaseSettings):
     # Custom LLM Config (from .env)
     API_KEY: str = ""      # OpenAI-compatible API key for router / direct calls
     BASE_URL: str = "https://api.openai.com/v1"
-    MODEL_NAME: str = "gpt-4o-mini"
+    MODEL_NAME: str = "gpt-5.6-sol"
     AGENT_MODEL_NAME: str = "" # 将被 Router 映射的目标模型 (默认使用 MODEL_NAME)
+    DEEPSEEK_BASE_URL: str = "https://api.deepseek.com"
+    REASONING_EFFORT: str = "high"
     
     # Router Configuration Toggle
     # 如果为 True，SandboxGateway 将启动 Router 并劫持 claude 请求
     USE_LLM_ROUTER: bool = True
+    # Claude Code's dangerous permission bypass is opt-in and should remain
+    # disabled for shared/production deployments.
+    ALLOW_DANGEROUS_CLAUDE_PERMISSIONS: bool = False
     
     # [REFACTORED] Infrastructure Retries (Tenacity - Network Layer)
     # These are for API-level retries (500/429 errors), NOT business logic retries.
@@ -162,6 +177,31 @@ class Settings(BaseSettings):
         """
         if not self.AGENT_MODEL_NAME:
             self.AGENT_MODEL_NAME = self.MODEL_NAME
+        if not self.SECRET_KEY:
+            if self.ENVIRONMENT.lower() in {"production", "prod", "staging"}:
+                raise ValueError(
+                    "SECRET_KEY must be set explicitly in staging/production"
+                )
+            self.SECRET_KEY = secrets.token_urlsafe(48)
+            warnings.warn(
+                "SECRET_KEY is not set; generated an ephemeral local key. "
+                "Set SECRET_KEY in .env for persistent sessions.",
+                RuntimeWarning,
+                stacklevel=2,
+            )
+        if self.ENVIRONMENT.lower() in {"production", "prod", "staging"}:
+            if "*" in [str(origin) for origin in self.CORS_ORIGINS]:
+                raise ValueError("wildcard CORS is forbidden outside development")
+            if self.ALLOW_PUBLIC_REGISTRATION and not self.REQUIRE_INVITE_CODE:
+                raise ValueError(
+                    "public registration requires REQUIRE_INVITE_CODE outside development"
+                )
+            if self.SEED_LOCAL_ADMIN:
+                raise ValueError("SEED_LOCAL_ADMIN must be disabled outside development")
+        if self.SEED_LOCAL_ADMIN and not self.LOCAL_ADMIN_PASSWORD:
+            raise ValueError(
+                "LOCAL_ADMIN_PASSWORD is required when SEED_LOCAL_ADMIN is enabled"
+            )
         return self
 
     model_config = SettingsConfigDict(

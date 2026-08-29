@@ -9,7 +9,7 @@ from uuid import UUID
 from typing import List, Optional, Any
 from datetime import datetime
 
-from fastapi import APIRouter, Depends, HTTPException, UploadFile, File, Form
+from fastapi import APIRouter, Depends, HTTPException, UploadFile, File, Form, Request
 from fastapi.responses import StreamingResponse, Response
 from sse_starlette.sse import EventSourceResponse
 
@@ -38,7 +38,7 @@ from app.api.schemas import (
     NodeHistoryResponse, UnifiedHistoryEntry, HistoryArtifact,  # [REFACTORED] Linear history
     ProjectDetailResponse,  # [NEW] Add new schema for project detail
     CopilotSession,  # [NEW] Session schema
-    RuntimeConfig  # [BYOK] Runtime configuration
+    RuntimeConfig, ModelConfig  # [BYOK] Runtime configuration
 )
 from app.domain.unified_io import CopilotStreamChunk
 from app.api.deps import (
@@ -48,8 +48,34 @@ from app.api.deps import (
     get_runtime_config, get_export_service  # [BYOK] Runtime config dependency
 )
 
-router = APIRouter()
 logger = logging.getLogger(__name__)
+
+
+async def enforce_project_access(
+    request: Request,
+    user_id: str = Depends(get_current_user_id),
+    repo: ProjectRepository = Depends(get_project_repo),
+):
+    """Apply one owner check to every endpoint carrying a project_id.
+
+    Keeping this at the router boundary prevents a newly added project route
+    (including SSE routes) from accidentally becoming an IDOR.  Individual
+    handlers can still apply finer-grained team permissions.
+    """
+    raw_project_id = request.path_params.get("project_id")
+    if raw_project_id is None:
+        return
+    try:
+        project_id = UUID(str(raw_project_id))
+    except (TypeError, ValueError):
+        raise HTTPException(status_code=404, detail="Project not found")
+    project = await repo.get(project_id)
+    if not project or str(project.owner_id) != str(user_id):
+        raise HTTPException(status_code=404, detail="Project not found")
+    request.state.project = project
+
+
+router = APIRouter(dependencies=[Depends(enforce_project_access)])
 
 
 # [NEW] SSE Helper
@@ -86,7 +112,10 @@ async def chat_completions(
             # Re-use CopilotStreamChunk logic or standard chunks
             async for chunk in llm.stream_chat(
                 messages=messages_dicts,
-                model_config=None, # Use system default or extract from req if needed
+                model_config=ModelConfig(
+                    modelName=req.model,
+                    temperature=req.temperature,
+                ),
                 temperature=req.temperature,
                 runtime=runtime  # [BYOK]
             ):
@@ -324,7 +353,9 @@ async def update_project(
 ):
     """[NEW] Update project metadata."""
     try:
-        project = await ws.update_project(project_id, request.name, request.assets)
+        project = await ws.update_project(
+            project_id, request.name, request.assets, owner_id=user_id
+        )
         return ProjectSummary(id=project.id, name=project.name, updated_at=project.updated_at)
     except Exception as e:
         raise HTTPException(404, str(e))
@@ -337,7 +368,7 @@ async def delete_project(
 ):
     """[NEW] Delete project."""
     try:
-        await ws.delete_project(project_id)
+        await ws.delete_project(project_id, owner_id=user_id)
     except Exception as e:
         raise HTTPException(404, str(e))
 
@@ -813,7 +844,12 @@ async def preview_node_version(
     if not blueprint: raise HTTPException(404, "Blueprint not found")
 
     version = await v_repo.get(version_id)
-    if not version: raise HTTPException(404, "Version not found")
+    if (
+        not version
+        or version.project_id != project_id
+        or version.node_id != node_id
+    ):
+        raise HTTPException(404, "Version not found")
 
     # Assemble view using this specific version
     return assembler.assemble(project, node_id, blueprint, version)
@@ -867,7 +903,9 @@ async def fork_node_rpc(
     # [FIX] Resolve artifact_id to target_output_index if provided
     target_output_index = request.target_output_index
     if request.artifact_id and target_uuid:
-        target_output_index = await ws._resolve_output_index_by_artifact(target_uuid, request.artifact_id)
+        target_output_index = await ws._resolve_output_index_by_artifact(
+            project_id, node_id, target_uuid, request.artifact_id
+        )
         if target_output_index is None:
             raise HTTPException(404, f"Artifact {request.artifact_id} not found in version {target_uuid}")
 
@@ -958,7 +996,7 @@ async def list_copilot_sessions(
     user_id: str = Depends(get_current_user_id)
 ):
     """List all sessions for a project."""
-    return await copilot.list_sessions(project_id)
+    return await copilot.list_sessions(project_id, user_id=user_id)
 
 @router.post("/projects/{project_id}/sessions", status_code=201)
 async def create_copilot_session(
@@ -967,7 +1005,7 @@ async def create_copilot_session(
     user_id: str = Depends(get_current_user_id)
 ):
     """Create a new copilot session."""
-    return await copilot.create_session(project_id)
+    return await copilot.create_session(project_id, user_id=user_id)
 
 @router.get("/sessions/{session_id}/messages")
 async def get_session_history(
@@ -976,7 +1014,7 @@ async def get_session_history(
     user_id: str = Depends(get_current_user_id)
 ):
     """Get message history for a session."""
-    return await copilot.get_history(session_id)
+    return await copilot.get_history(session_id, user_id=user_id)
 
 @router.delete("/sessions/{session_id}", status_code=204)
 async def delete_copilot_session(
@@ -985,7 +1023,7 @@ async def delete_copilot_session(
     user_id: str = Depends(get_current_user_id)
 ):
     """Delete (archive) a copilot session."""
-    await copilot.delete_session(session_id)
+    await copilot.delete_session(session_id, user_id=user_id)
 
 @router.post("/copilot/chat")
 async def copilot_chat(
@@ -1013,7 +1051,8 @@ async def copilot_chat(
                 msgs,
                 model_config=request.llm_config,
                 session_id=request.session_id,  # [NEW] Pass session_id
-                runtime=runtime  # [BYOK]
+                runtime=runtime,  # [BYOK]
+                user_id=user_id
             )
             
             async for chunk in generator:

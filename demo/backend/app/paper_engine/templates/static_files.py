@@ -10,6 +10,7 @@ import sys
 import os
 import json
 import re
+from pathlib import Path
 
 def check_integrity():
     if not os.path.exists("structure.json"): return True
@@ -32,7 +33,10 @@ def run():
     print(">>> [Fast Compile] Starting...")
 
     # Clean aux
-    subprocess.run("rm -f *.aux *.log *.out *.pdf", shell=True)
+    for pattern in ("*.aux", "*.log", "*.out", "*.pdf"):
+        for artifact in Path(".").glob(pattern):
+            if artifact.is_file():
+                artifact.unlink()
 
     # Compile
     cmd = ["latexmk", "-pdf", "-xelatex", "-interaction=nonstopmode", "-halt-on-error", "main.tex"]

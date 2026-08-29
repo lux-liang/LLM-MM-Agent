@@ -26,7 +26,7 @@ function getBYOKHeaders(): Record<string, string> {
 export class SSEConnection {
   private ctrl: AbortController | null = null;
   
-  constructor(private onMsg: (d: any, t: string) => void, private onStatus: (s: string) => void) {}
+  constructor(private onMsg: (d: unknown, t: string) => void, private onStatus: (s: string) => void) {}
 
   connect(url: string, token: string, customHeaders?: Record<string, string>) {
     this.disconnect();

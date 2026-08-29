@@ -18,6 +18,11 @@ import threading
 
 from app.core.config import settings
 from app.core.exceptions import ExecutionError
+from app.core.llm_security import (
+    normalize_llm_model,
+    safe_llm_base_url,
+    server_key_allowed_for_target,
+)
 from app.core.templates import jinja_env
 from app.domain.unified_io import NodeOutput, ContentBlock, BlockType
 from app.infra.asset_manager import AssetManager
@@ -523,6 +528,44 @@ class SandboxGateway:
         # e.g. img/plot.png -> img/plot.png
         return v_path.lstrip("/")
 
+    def _resolve_sandbox_llm_config(
+        self, runtime: Optional[RuntimeConfig]
+    ) -> Tuple[str, str, str]:
+        runtime_base = runtime.llm_base_url if runtime and runtime.llm_base_url else None
+        runtime_key = runtime.llm_api_key if runtime and runtime.llm_api_key else None
+        model = normalize_llm_model(
+            (runtime.llm_model_name if runtime else None)
+            or settings.AGENT_MODEL_NAME
+            or settings.MODEL_NAME
+        )
+        base = runtime_base or settings.BASE_URL
+        deepseek = model.lower().startswith("deepseek")
+        if deepseek and (not base or base.rstrip("/") == "https://api.openai.com/v1"):
+            base = getattr(settings, "DEEPSEEK_BASE_URL", "https://api.deepseek.com")
+        try:
+            base = safe_llm_base_url(base, model)
+        except ValueError as exc:
+            raise ExecutionError("LLM", f"Unsafe sandbox LLM base URL: {exc}") from exc
+
+        if runtime_base and not runtime_key and not server_key_allowed_for_target(
+            base, model, settings.BASE_URL
+        ):
+            raise ExecutionError(
+                "LLM",
+                "A custom sandbox LLM base URL requires a user-supplied API key.",
+            )
+        if runtime_key:
+            key = runtime_key
+        elif deepseek:
+            key = getattr(settings, "DEEPSEEK_API_KEY", "") or settings.API_KEY
+        elif is_anthropic_compatible_base(base):
+            key = settings.ANTHROPIC_API_KEY or settings.API_KEY
+        else:
+            key = settings.OPENAI_API_KEY or settings.API_KEY
+        if not key:
+            raise ExecutionError("LLM", "No API key configured for the sandbox model provider")
+        return model, base, key
+
     async def _setup_router(self, sb: AsyncSandbox, runtime: Optional[RuntimeConfig] = None) -> str:
         """
         初始化 Claude Code Router。
@@ -533,7 +576,7 @@ class SandboxGateway:
         if not settings.USE_LLM_ROUTER:
             return ""
 
-        base = (runtime.llm_base_url if runtime else None) or settings.BASE_URL
+        model, base, key = self._resolve_sandbox_llm_config(runtime)
         if is_anthropic_compatible_base(base):
             logger.info("Using Anthropic-compatible Claude Code endpoint directly; router disabled.")
             return ""
@@ -546,10 +589,6 @@ class SandboxGateway:
 
         # [BYOK] Resolve config for Router Config File
         # 修复：确保 runtime 可用，避免 NameError
-        key = (runtime.llm_api_key if runtime else None) or settings.OPENAI_API_KEY or settings.API_KEY
-        base = (runtime.llm_base_url if runtime else None) or settings.BASE_URL
-        model = (runtime.llm_model_name if runtime else None) or settings.AGENT_MODEL_NAME or settings.MODEL_NAME
-
         if base and "/chat/completions" not in base:
             base = base.rstrip("/") + "/chat/completions"
 
@@ -634,16 +673,9 @@ class SandboxGateway:
             env["ANTHROPIC_MODEL"] = "default"
             logger.info(f"🚀 Starting Agent CLI in ROUTER MODE (Target: {settings.AGENT_MODEL_NAME})")
         else:
-            # [FIX] Direct Mode Fallback with BYOK support
-            # Use runtime key if available, else fallback to settings
-            byok_key = runtime.llm_api_key if runtime else None
-            direct_key = byok_key or settings.ANTHROPIC_API_KEY or settings.API_KEY or ""
-            direct_base = (runtime.llm_base_url if runtime else None) or settings.BASE_URL
-            direct_model = (
-                (runtime.llm_model_name if runtime else None)
-                or settings.AGENT_MODEL_NAME
-                or settings.MODEL_NAME
-            )
+            # Direct mode uses the same outbound URL and credential boundary
+            # as the router path.
+            direct_model, direct_base, direct_key = self._resolve_sandbox_llm_config(runtime)
 
             if is_anthropic_compatible_base(direct_base):
                 normalized_model = normalize_anthropic_model(direct_model)
@@ -662,14 +694,16 @@ class SandboxGateway:
                 logger.info(f"🚀 Starting Agent CLI in ANTHROPIC-COMPAT DIRECT MODE (Target: {normalized_model})")
             else:
                 env["ANTHROPIC_API_KEY"] = direct_key
-                env["OPENAI_API_KEY"] = byok_key or settings.OPENAI_API_KEY
+                env["OPENAI_API_KEY"] = direct_key
                 env["ANTHROPIC_BASE_URL"] = "https://api.anthropic.com"
                 logger.info("🚀 Starting Agent CLI in DIRECT MODE")
 
         # [FIX] Use dynamic timeout or fallback to global hard cap
         execution_timeout = timeout or settings.SANDBOX_EXECUTION_TIMEOUT
 
-        cmd = "claude -p < prompt.txt --dangerously-skip-permissions"
+        cmd = "claude -p < prompt.txt"
+        if getattr(settings, "ALLOW_DANGEROUS_CLAUDE_PERMISSIONS", False):
+            cmd += " --dangerously-skip-permissions"
         logger.info(f"Starting Agent CLI: {cmd} (Timeout: {execution_timeout}s)")
 
         queue: asyncio.Queue = asyncio.Queue()

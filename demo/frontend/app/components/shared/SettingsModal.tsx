@@ -18,7 +18,7 @@ import {
 interface ValidationResult {
   success: boolean;
   message: string;
-  details?: Record<string, any>;
+  details?: Record<string, unknown>;
 }
 
 export function SettingsModal() {
@@ -91,7 +91,7 @@ export function SettingsModal() {
 
           <div className="bg-blue-50/50 border border-blue-100 rounded-xl p-4 text-xs text-blue-800 leading-relaxed">
             <strong>Note:</strong> These settings are stored locally. 
-            API Keys are stored in <strong>Local Storage</strong> and will persist across browser sessions.
+            API keys are kept in <strong>Session Storage</strong> and are cleared when the browser session ends.
             They are sent to the backend as <code className="bg-blue-100 px-1 py-0.5 rounded">X-LLM-*</code> headers.
           </div>
 
@@ -105,7 +105,8 @@ export function SettingsModal() {
             </label>
             <input
               type="text"
-              placeholder="e.g., claude-3-5-sonnet-20241022"
+              list="supported-models"
+              placeholder="gpt-5.6-sol or deepseek-v4-pro"
               value={config.modelName}
               onChange={(e) => {
                 updateConfig({ modelName: e.target.value });
@@ -113,6 +114,10 @@ export function SettingsModal() {
               }}
               className="w-full px-4 py-3 bg-white border border-slate-200 rounded-xl text-sm focus:outline-none focus:ring-2 focus:ring-black/5 focus:border-slate-400 font-mono transition-all"
             />
+            <datalist id="supported-models">
+              <option value="gpt-5.6-sol" />
+              <option value="deepseek-v4-pro" />
+            </datalist>
           </div>
 
           {/* API Key */}
@@ -147,7 +152,7 @@ export function SettingsModal() {
             <div className="relative">
               <input
                 type="password"
-                placeholder="sk-ant-api03-..."
+                placeholder="Provider API key"
                 value={config.apiKey}
                 onChange={(e) => {
                   updateConfig({ apiKey: e.target.value });
@@ -226,7 +231,7 @@ export function SettingsModal() {
             </label>
             <input
               type="text"
-              placeholder="e.g., https://api.openrouter.ai/v1"
+              placeholder="https://api.openai.com/v1 or https://api.deepseek.com"
               value={config.baseUrl}
               onChange={(e) => {
                 updateConfig({ baseUrl: e.target.value });
@@ -235,7 +240,7 @@ export function SettingsModal() {
               className="w-full px-4 py-3 bg-white border border-slate-200 rounded-xl text-sm focus:outline-none focus:ring-2 focus:ring-black/5 focus:border-slate-400 font-mono text-slate-600 transition-all"
             />
             <p className="text-[11px] text-slate-400 px-1">
-              Use this if you are using a proxy or a compatible provider like OpenRouter, SiliconFlow, etc.
+              Custom hosts must be server-allowlisted and must use the API key entered above.
             </p>
           </div>
         </div>

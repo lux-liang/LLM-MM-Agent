@@ -3,10 +3,16 @@ Standalone API Validation Endpoint for testing LLM and E2B configurations.
 Does not require database connection.
 """
 import logging
+import os
 from typing import Optional
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel
 import httpx
+
+from app.core.llm_security import (
+    normalize_llm_model,
+    safe_llm_base_url as _safe_llm_base_url,
+)
 
 from app.infra.gateways.anthropic_compat import (
     anthropic_headers,
@@ -18,6 +24,10 @@ from app.infra.gateways.anthropic_compat import (
 logger = logging.getLogger(__name__)
 
 router = APIRouter()
+
+def _redact(value: str, secret: str = "") -> str:
+    text = str(value)
+    return text.replace(secret, "[REDACTED]")[:300] if secret else text[:300]
 
 
 class ValidateConfigRequest(BaseModel):
@@ -80,8 +90,8 @@ async def validate_llm_config(
     try:
         # Test with actual chat completion call
         test_api_key = api_key or ""
-        test_base_url = base_url or "https://api.openai.com/v1"
-        test_model = model_name or "gpt-4o-mini"
+        test_base_url = _safe_llm_base_url(base_url, model_name)
+        test_model = normalize_llm_model(model_name or "gpt-5.6-sol")
 
         async with httpx.AsyncClient(timeout=30.0) as client:
             if is_anthropic_compatible_base(test_base_url):
@@ -93,7 +103,7 @@ async def validate_llm_config(
                         test_model,
                         max_tokens=16,
                     ),
-                    follow_redirects=True
+                    follow_redirects=False
                 )
                 if response.status_code == 200:
                     return ValidateConfigResponse(
@@ -112,6 +122,7 @@ async def validate_llm_config(
                     error_msg = error_data.get("error", {}).get("message", response.text)
                 except Exception:
                     error_msg = response.text[:200]
+                error_msg = _redact(str(error_msg), test_api_key)[:300]
                 return ValidateConfigResponse(
                     success=False,
                     message=f"API error ({response.status_code}): {error_msg}",
@@ -138,15 +149,23 @@ async def validate_llm_config(
 
             try:
                 # Make a REAL chat completion call with minimal test message
+                payload = {
+                    "model": test_model,
+                    "messages": [{"role": "user", "content": "Hi"}],
+                }
+                if test_model.lower().startswith("gpt-5"):
+                    payload["max_completion_tokens"] = 16
+                    payload["reasoning_effort"] = os.getenv("REASONING_EFFORT", "low")
+                else:
+                    payload["max_tokens"] = 16
+                if test_model.lower().startswith("deepseek-v4"):
+                    payload["thinking"] = {"type": "enabled"}
+                    payload["reasoning_effort"] = "low"
                 response = await client.post(
                     test_url,
                     headers=headers,
-                    json={
-                        "model": test_model,
-                        "messages": [{"role": "user", "content": "Hi"}],
-                        "max_tokens": 10
-                    },
-                    follow_redirects=True
+                    json=payload,
+                    follow_redirects=False
                 )
 
                 if response.status_code == 200:
@@ -174,6 +193,7 @@ async def validate_llm_config(
                         error_msg = error_data.get("error", {}).get("message", str(response.text))
                     except:
                         error_msg = response.text[:200]
+                    error_msg = _redact(str(error_msg), test_api_key)[:300]
 
                     return ValidateConfigResponse(
                         success=False,
@@ -185,7 +205,7 @@ async def validate_llm_config(
                 return ValidateConfigResponse(
                     success=False,
                     message="Cannot connect to API server. Check your base URL.",
-                    details={"error": f"Connection failed: {str(e)}"}
+                    details={"error": _redact(f"Connection failed: {str(e)}", test_api_key)}
                 )
             except httpx.TimeoutException:
                 return ValidateConfigResponse(
@@ -195,11 +215,11 @@ async def validate_llm_config(
                 )
                 
     except Exception as e:
-        logger.error(f"LLM validation error: {e}")
+        logger.error("LLM validation error: %s", _redact(str(e), test_api_key if "test_api_key" in locals() else ""))
         return ValidateConfigResponse(
             success=False,
-            message=f"Validation failed: {str(e)}",
-            details={"error": str(e)}
+            message=f"Validation failed: {_redact(str(e), test_api_key if 'test_api_key' in locals() else '')}",
+            details={"error": _redact(str(e), test_api_key if "test_api_key" in locals() else "")}
         )
 
 

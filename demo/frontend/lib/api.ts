@@ -1,5 +1,3 @@
-import { toast } from "sonner";
-
 const API_BASE = process.env.NEXT_PUBLIC_API_BASE || "http://localhost:8000/api/v1";
 
 const PUBLIC_CONFIG_KEY = "mm_agent_config_public";
@@ -42,7 +40,8 @@ const getLLMConfig = () => {
   return {
     modelName: publicRaw?.modelName || legacyConfig?.modelName || "",
     baseUrl: publicRaw?.baseUrl || legacyConfig?.baseUrl || "",
-    apiKey: secureConfig?.apiKey || legacyConfig?.apiKey || "",
+    // Never resurrect a provider key from the legacy persistent store.
+    apiKey: secureConfig?.apiKey || "",
   };
 };
 

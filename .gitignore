@@ -37,8 +37,11 @@ coverage.xml
 .hypothesis/
 .pytest_cache/
 
-# Environments
+# Environments and local credentials
 .env
+.env.*
+!.env.example
+!demo/frontend/.env.local.example
 .venv
 env/
 venv/
@@ -56,3 +59,17 @@ venv.bak/
 # OS
 .DS_Store
 Thumbs.db
+
+# Papers and generated evaluation reports stay local by default.  Individual
+# files may only be committed after award provenance and redistribution rights
+# have both been verified.
+MMBench/cumcm/references/
+MMBench/cumcm/reports/
+MMBench/cumcm/samples/
+
+# Demo runtime and build outputs
+demo/runtime/
+demo/backend/runtime/
+demo/backend/.venv/
+demo/frontend/node_modules/
+demo/frontend/.next/

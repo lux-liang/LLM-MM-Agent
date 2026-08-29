@@ -90,10 +90,10 @@ class ModelConfig(BaseModel):
 
 # [FIX Issue 3] Standard OpenAI Chat Request for direct pass-through
 class ChatCompletionRequest(BaseModel):
-    model: str = "gpt-4o"
+    model: str = "gpt-5.6-sol"
     messages: List[ChatMessage]
     stream: bool = False
-    temperature: Optional[float] = 0.7
+    temperature: Optional[float] = None
 
 # --- Requests (Write) ---
 

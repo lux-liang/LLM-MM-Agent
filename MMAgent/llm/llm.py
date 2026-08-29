@@ -1,108 +1,313 @@
+"""Small OpenAI-compatible client used by the research CLI.
+
+The original implementation mixed model routing, accounting and error
+handling in one method. This module keeps the public LLM API compatible
+while making provider-specific reasoning parameters explicit and safe.
+"""
+
+from __future__ import annotations
+
+import logging
 import os
-import requests
-import openai
-from dotenv import load_dotenv
-import json
+from dataclasses import dataclass
+from typing import Any, Dict, Optional
+
+try:
+    import openai
+except ImportError:  # keep configuration/profile helpers importable in minimal envs
+    openai = None
+try:
+    from dotenv import load_dotenv
+except ImportError:  # optional for callers that already export env variables
+    def load_dotenv():
+        return False
 
 load_dotenv()
+logger = logging.getLogger(__name__)
+
+MODEL_ALIASES = {
+    "deepseekv4pro": "deepseek-v4-pro",
+    "deepseek-v4-pro": "deepseek-v4-pro",
+    "deepseek pro": "deepseek-v4-pro",
+    "gpt5.6sol": "gpt-5.6-sol",
+    "gpt-5.6-sol": "gpt-5.6-sol",
+    "gpt-5.6": "gpt-5.6-sol",
+}
 
 
-def _is_gpt5_family(model: str) -> bool:
-    """Return whether a provider-prefixed model name belongs to GPT-5."""
-    model_id = (model or "").rsplit("/", 1)[-1].lower()
+@dataclass(frozen=True)
+class ModelProfile:
+    model: str
+    base_url: str
+    provider: str
+    reasoning: bool
+    reasoning_effort: Optional[str]
+
+
+class LLMGenerationError(RuntimeError):
+    """Raised when an API request fails without leaking credentials."""
+
+
+def normalize_model_name(model_name: str) -> str:
+    raw = (model_name or "").strip()
+    return MODEL_ALIASES.get(raw.lower(), raw)
+
+
+def _is_deepseek(model: str, base_url: str = "") -> bool:
+    model_id = normalize_model_name(model).lower().rsplit("/", 1)[-1]
+    if model_id.startswith(("gpt-", "o1", "o3", "o4")):
+        return False
+    return model_id.startswith("deepseek-") or "deepseek" in (base_url or "").lower()
+
+
+def _is_reasoning_model(model: str) -> bool:
+    model_id = normalize_model_name(model).lower().rsplit("/", 1)[-1]
     return (
-        model_id == "gpt-5"
-        or model_id.startswith("gpt-5-")
-        or model_id.startswith("gpt-5.")
+        model_id.startswith("gpt-5")
+        or model_id.startswith("o1")
+        or model_id.startswith("o3")
+        or model_id.startswith("o4")
+        or model_id.startswith("deepseek-v4")
+        or model_id == "deepseek-reasoner"
     )
 
 
-def _sampling_params_for_model(model: str):
-    """Return sampling parameters only for models that accept them."""
-    if _is_gpt5_family(model):
-        return {}
+def resolve_model_profile(
+    model_name: str,
+    api_base: Optional[str] = None,
+    reasoning_effort: Optional[str] = None,
+) -> ModelProfile:
+    model = normalize_model_name(
+        model_name or os.getenv("MMAGENT_MODEL_NAME", "gpt-5.6-sol")
+    )
+    configured_base = api_base or os.getenv("MMAGENT_BASE_URL")
+    if configured_base and model.lower().startswith("deepseek-") and "api.openai.com" in configured_base.lower():
+        raise ValueError("DeepSeek models cannot use the official OpenAI endpoint")
+    if configured_base and model.lower().startswith(("gpt-", "o1", "o3", "o4")) and "api.deepseek.com" in configured_base.lower():
+        raise ValueError("OpenAI models cannot use the official DeepSeek endpoint")
+    if _is_deepseek(model, configured_base or ""):
+        base_url = configured_base or os.getenv(
+            "DEEPSEEK_API_BASE",
+            os.getenv("DEEPSEEK_BASE_URL", "https://api.deepseek.com"),
+        )
+        provider = "deepseek"
+    else:
+        base_url = configured_base or os.getenv(
+            "OPENAI_BASE_URL",
+            os.getenv("OPENAI_API_BASE", "https://api.openai.com/v1"),
+        )
+        provider = "openai"
+
+    effort = reasoning_effort or os.getenv("MMAGENT_REASONING_EFFORT")
+    if effort:
+        effort = effort.lower()
+        if effort not in {"none", "low", "medium", "high", "xhigh", "max"}:
+            raise ValueError(
+                "reasoning_effort must be one of none, low, medium, high, xhigh, max"
+            )
+    if provider == "deepseek" and effort in {"medium", "xhigh", "max"}:
+        # DeepSeek's OpenAI-compatible endpoint exposes low/high/max-style
+        # reasoning controls; map unsupported OpenAI granularity explicitly.
+        effort = "high" if effort != "max" else "max"
+    return ModelProfile(
+        model=model,
+        base_url=base_url,
+        provider=provider,
+        reasoning=_is_reasoning_model(model),
+        reasoning_effort=effort,
+    )
+
+
+def _usage_dict(response: Any) -> Dict[str, int]:
+    usage = getattr(response, "usage", None)
+    if usage is None:
+        return {"completion_tokens": 0, "prompt_tokens": 0, "total_tokens": 0}
+
+    def read(name: str) -> int:
+        value = getattr(usage, name, None)
+        if value is None and isinstance(usage, dict):
+            value = usage.get(name, 0)
+        return int(value or 0)
+
     return {
-        "temperature": 0.7,
-        "top_p": 1.0,
-        "frequency_penalty": 0.0,
-        "presence_penalty": 0.0,
+        "completion_tokens": read("completion_tokens"),
+        "prompt_tokens": read("prompt_tokens"),
+        "total_tokens": read("total_tokens"),
     }
 
 
 class LLM:
-
-    usages = []
-    def __init__(self, model_name, key, logger=None, user_id=None):
-        self.model_name = model_name
-        self.logger = logger
+    def __init__(
+        self,
+        model_name: str,
+        key: Optional[str] = None,
+        logger: Optional[logging.Logger] = None,
+        user_id: Optional[str] = None,
+        api_base: Optional[str] = None,
+        reasoning_effort: Optional[str] = None,
+    ):
+        self.logger = logger or logging.getLogger(__name__)
         self.user_id = user_id
-        self.api_key = key
-        
-        # Set API base URL based on model or use default OpenAI base
-        if self.model_name in ['deepseek-chat', 'deepseek-reasoner']:
-            self.api_base = os.getenv('DEEPSEEK_API_BASE')
-        elif self.model_name in ['qwen2.5-72b-instruct']:
-            self.api_base = "https://dashscope.aliyuncs.com/compatible-mode/v1"
-        elif self.model_name in ['gpt-4o', 'gpt-4']:
-            self.api_base = os.getenv('OPENAI_API_BASE')
-        else:
-            # Default to OpenAI API base for other OpenAI-compatible models
-            # For models requiring different API endpoints, use the reset() method
-            # to override api_base after initialization
-            self.api_base = os.getenv('OPENAI_API_BASE', 'https://api.openai.com/v1')
-        
+        self.profile = resolve_model_profile(model_name, api_base, reasoning_effort)
+        provider_key = (
+            os.getenv("DEEPSEEK_API_KEY")
+            if self.profile.provider == "deepseek"
+            else os.getenv("OPENAI_API_KEY")
+        )
+        self.api_key = key or provider_key or os.getenv("MMAGENT_API_KEY")
         if not self.api_key:
-            raise ValueError('API key not found in environment variables')
+            raise ValueError(
+                "API key not found; pass --key or set the provider key "
+                "(OPENAI_API_KEY/DEEPSEEK_API_KEY) or MMAGENT_API_KEY"
+            )
+        self.model_name = self.profile.model
+        self.api_base = self.profile.base_url
+        self.reasoning_effort = self.profile.reasoning_effort
+        self.usages: list[Dict[str, int]] = []
+        if openai is None:
+            raise RuntimeError(
+                "openai package is required for LLM calls; install it from requirements.txt"
+            )
+        self.client = openai.OpenAI(api_key=self.api_key, base_url=self.api_base)
 
-        self.client = openai.Client(api_key=self.api_key, base_url=self.api_base)
-
-    def reset(self, api_key=None, api_base=None, model_name=None):
+    def reset(
+        self,
+        api_key: Optional[str] = None,
+        api_base: Optional[str] = None,
+        model_name: Optional[str] = None,
+        reasoning_effort: Optional[str] = None,
+    ):
+        previous_provider = self.profile.provider
         if api_key:
             self.api_key = api_key
-        if api_base:
-            self.api_base = api_base
-        if model_name:
-            self.model_name = model_name
-        self.client = openai.Client(api_key=self.api_key, base_url=self.api_base)
-
-    def generate(self, prompt, system="You are a helpful assistant.", usage=True):
-        try:
-            request_params = {
-                "model": self.model_name,
-                "messages": [
-                    {'role': 'system', 'content': system},
-                    {'role': 'user', 'content': prompt}
-                ],
-            }
-            request_params.update(_sampling_params_for_model(self.model_name))
-            response = self.client.chat.completions.create(
-                **request_params
+        if model_name or api_base or reasoning_effort:
+            # When the model changes providers, do not carry the previous
+            # provider's default endpoint into the new profile.
+            profile_base = api_base
+            if profile_base is None and not model_name:
+                profile_base = self.api_base
+            self.profile = resolve_model_profile(
+                model_name or self.model_name,
+                profile_base,
+                reasoning_effort or self.reasoning_effort,
             )
-            answer = response.choices[0].message.content
-            usage = {
-                'completion_tokens': response.usage.completion_tokens,
-                'prompt_tokens': response.usage.prompt_tokens,
-                'total_tokens': response.usage.total_tokens
-            }
-            if self.logger:
-                self.logger.info(f"[LLM] UserID: {self.user_id} Key: {self.api_key}, Model: {self.model_name}, Usage: {usage}")
-            if usage:
-                self.usages.append(usage)
-            return answer
+            self.model_name = self.profile.model
+            self.api_base = self.profile.base_url
+            self.reasoning_effort = self.profile.reasoning_effort
+        if not api_key:
+            provider_key = (
+                os.getenv("DEEPSEEK_API_KEY")
+                if self.profile.provider == "deepseek"
+                else os.getenv("OPENAI_API_KEY")
+            )
+            configured_key = provider_key or os.getenv("MMAGENT_API_KEY")
+            if configured_key:
+                self.api_key = configured_key
+            elif self.profile.provider != previous_provider:
+                raise ValueError(
+                    f"No API key configured for provider {self.profile.provider}"
+                )
+        if openai is None:
+            raise RuntimeError(
+                "openai package is required for LLM calls; install it from requirements.txt"
+            )
+        self.client = openai.OpenAI(api_key=self.api_key, base_url=self.api_base)
 
-        except Exception as e:
-            return f'An error occurred: {e}'
-
-    def get_total_usage(self):
-        total_usage = { 
-            'completion_tokens': 0,
-            'prompt_tokens': 0,
-            'total_tokens': 0
+    def _request_params(
+        self,
+        prompt: str,
+        system: str,
+        *,
+        max_tokens: Optional[int] = None,
+        response_format: Optional[dict] = None,
+    ) -> Dict[str, Any]:
+        params: Dict[str, Any] = {
+            "model": self.model_name,
+            "messages": [
+                {"role": "system", "content": system},
+                {"role": "user", "content": prompt},
+            ],
         }
-        for usage in self.usages:
-            for key, value in usage.items():
-                total_usage[key] += value
-        return total_usage
-        
+        if max_tokens is not None:
+            if self.profile.provider == "openai" and self.profile.reasoning:
+                params["max_completion_tokens"] = max_tokens
+            else:
+                params["max_tokens"] = max_tokens
+        if response_format is not None:
+            params["response_format"] = response_format
+        if self.profile.reasoning:
+            if self.reasoning_effort is not None and not (
+                self.profile.provider == "deepseek"
+                and self.reasoning_effort == "none"
+            ):
+                params["reasoning_effort"] = self.reasoning_effort
+            if self.profile.provider == "deepseek":
+                thinking = (
+                    "disabled"
+                    if self.reasoning_effort == "none"
+                    else "enabled"
+                )
+                params["extra_body"] = {"thinking": {"type": thinking}}
+        else:
+            params.update(
+                {
+                    "temperature": float(
+                        os.getenv("MMAGENT_TEMPERATURE", "0.7")
+                    ),
+                    "top_p": 1.0,
+                }
+            )
+        return params
+
+    def generate(
+        self,
+        prompt: str,
+        system: str = "You are a helpful assistant.",
+        usage: bool = True,
+        **kwargs: Any,
+    ) -> str:
+        params = self._request_params(
+            prompt,
+            system,
+            max_tokens=kwargs.get("max_tokens"),
+            response_format=kwargs.get("response_format"),
+        )
+        try:
+            response = self.client.chat.completions.create(**params)
+            if not getattr(response, "choices", None):
+                raise LLMGenerationError("provider returned no choices")
+            message = response.choices[0].message
+            answer = getattr(message, "content", None) or ""
+            if usage:
+                self.usages.append(_usage_dict(response))
+            self.logger.info(
+                "[LLM] model=%s user=%s usage=%s",
+                self.model_name,
+                self.user_id or "anonymous",
+                self.usages[-1] if usage else {},
+            )
+            return answer
+        except Exception as exc:
+            self.logger.error(
+                "LLM generation failed for model=%s: %s",
+                self.model_name,
+                str(exc).replace(self.api_key, "[REDACTED]")[:300],
+            )
+            raise LLMGenerationError(
+                f"LLM request failed for model {self.model_name}: "
+                f"{str(exc).replace(self.api_key, '[REDACTED]')[:300]}"
+            ) from exc
+
+    def get_total_usage(self) -> Dict[str, int]:
+        total = {
+            "completion_tokens": 0,
+            "prompt_tokens": 0,
+            "total_tokens": 0,
+        }
+        for item in self.usages:
+            for key in total:
+                total[key] += int(item.get(key, 0))
+        return total
+
     def clear_usage(self):
-        self.usages = []
+        self.usages.clear()

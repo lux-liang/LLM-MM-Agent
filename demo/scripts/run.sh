@@ -78,7 +78,7 @@ PY
     cd "$BACKEND_DIR"
     # shellcheck disable=SC1091
     source "$BACKEND_DIR/.venv/bin/activate"
-    backend_pid="$(start_detached "$LOG_DIR/backend.log" python -m uvicorn app.main:app --host 0.0.0.0 --port "$BACKEND_PORT")"
+    backend_pid="$(start_detached "$LOG_DIR/backend.log" python -m uvicorn app.main:app --host 127.0.0.1 --port "$BACKEND_PORT")"
     echo "$backend_pid" > "$PID_DIR/backend.pid"
     assert_started "Backend" "$backend_pid" "$LOG_DIR/backend.log"
   )
@@ -98,10 +98,10 @@ else
     fi
 
     if [ "$FRONTEND_MODE" = "dev" ]; then
-      frontend_pid="$(start_detached "$LOG_DIR/frontend.log" npm run dev -- --hostname 0.0.0.0 --port "$FRONTEND_PORT")"
+      frontend_pid="$(start_detached "$LOG_DIR/frontend.log" npm run dev -- --hostname 127.0.0.1 --port "$FRONTEND_PORT")"
     else
       npm run build
-      frontend_pid="$(start_detached "$LOG_DIR/frontend.log" npm run start -- --hostname 0.0.0.0 --port "$FRONTEND_PORT")"
+      frontend_pid="$(start_detached "$LOG_DIR/frontend.log" npm run start -- --hostname 127.0.0.1 --port "$FRONTEND_PORT")"
     fi
 
     echo "$frontend_pid" > "$PID_DIR/frontend.pid"

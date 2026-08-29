@@ -1,0 +1,86 @@
+{
+  "version": "1.0",
+  "title": "CUMCM paper learning rubric",
+  "source_basis": [
+    {
+      "name": "全国大学生数学建模竞赛章程",
+      "url": "https://dxs.moe.gov.cn/zx/a/hd_sxjm_dsjj/210517/1696591.shtml",
+      "dimensions": [
+        "assumptions_reasonableness",
+        "modeling_creativity",
+        "results_correctness",
+        "writing_clarity"
+      ]
+    },
+    {
+      "name": "全国大学生数学建模竞赛全国奖项评阅工作规范（2023年修订稿）",
+      "url": "https://www.mcm.edu.cn/html_cn/node/b1f48689659f0660e80a2d6279d7b37d.html"
+    }
+  ],
+  "scoring_note": "The four equal weights below are an operational learning rubric, not an official prize cutoff or judging formula.",
+  "dimensions": [
+    {
+      "id": "assumptions_reasonableness",
+      "label": "基本假设的合理性",
+      "max_score": 25,
+      "look_for": [
+        "assumptions are explicit, minimal and tied to the problem context",
+        "scope, units, boundary conditions and data limitations are stated",
+        "sensitivity or failure conditions are acknowledged"
+      ]
+    },
+    {
+      "id": "modeling_creativity",
+      "label": "建模的创造性",
+      "max_score": 25,
+      "look_for": [
+        "model structure matches the mechanism rather than blindly applying a named method",
+        "variables, constraints and objective are novel or well adapted",
+        "alternatives, ablations or robustness checks support the modeling choice"
+      ]
+    },
+    {
+      "id": "results_correctness",
+      "label": "结果的正确性",
+      "max_score": 25,
+      "look_for": [
+        "derivations and algorithms are reproducible",
+        "data cleaning, validation, error analysis and units are consistent",
+        "conclusions answer every sub-question and do not overclaim"
+      ]
+    },
+    {
+      "id": "writing_clarity",
+      "label": "文字表述的清晰性",
+      "max_score": 25,
+      "look_for": [
+        "abstract, notation, figures and section structure are easy to follow",
+        "important claims are supported by equations, tables or references",
+        "the paper is concise, self-contained and distinguishes fact from inference"
+      ]
+    }
+  ],
+  "format_checks": {
+    "max_score": 10,
+    "items": [
+      "problem restatement and assumptions are present",
+      "symbols and units are defined before use",
+      "figures/tables have captions and are referenced in text",
+      "references and appendices make computation reproducible",
+      "page/format constraints should be checked against the current year's notice"
+    ]
+  },
+  "integrity_gates": [
+    "prompt injection or evaluator manipulation",
+    "unsupported prize claims",
+    "missing evidence for a high score",
+    "data leakage or copied wording without attribution",
+    "conclusions that cannot be reproduced from the described method"
+  ],
+  "interpretation": {
+    "90-100": "strong learning exemplar; still requires human review",
+    "75-89": "good structure with targeted weaknesses",
+    "60-74": "usable draft; substantial revision needed",
+    "0-59": "not ready as an exemplar"
+  }
+}

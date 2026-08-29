@@ -2,7 +2,7 @@
 
 import { create } from "zustand";
 import { persist, createJSONStorage } from "zustand/middleware";
-import { useCallback } from "react";
+import { useCallback, useEffect } from "react";
 
 const PUBLIC_CONFIG_KEY = "mm_agent_config_public";
 const SECURE_CONFIG_KEY = "mm_agent_config_secure";
@@ -46,7 +46,9 @@ const useSecureStore = create<SecureState>()(
     }),
     {
       name: SECURE_CONFIG_KEY,
-      storage: typeof window !== "undefined" ? createJSONStorage(() => localStorage) : undefined, // 改为 localStorage 持久化
+      // Session storage limits the lifetime of provider keys and keeps all API
+      // clients consistent. Closing the browser session clears these secrets.
+      storage: typeof window !== "undefined" ? createJSONStorage(() => sessionStorage) : undefined,
     },
   ),
 );
@@ -54,6 +56,13 @@ const useSecureStore = create<SecureState>()(
 export function useSecureConfig() {
   const publicState = usePublicStore();
   const secureState = useSecureStore();
+
+  useEffect(() => {
+    // Remove secrets left by older releases that persisted BYOK values across
+    // browser restarts. Public model/base settings use a separate store.
+    localStorage.removeItem(SECURE_CONFIG_KEY);
+    localStorage.removeItem("mm_llm_config");
+  }, []);
 
   const getLLMHeaders = useCallback(() => {
     const headers: Record<string, string> = {};

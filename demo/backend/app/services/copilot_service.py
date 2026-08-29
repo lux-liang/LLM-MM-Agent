@@ -42,18 +42,39 @@ class CopilotService:
         self.llm = llm
         self.repo = copilot_repo or CopilotRepository()  # Default fallback for backward compatibility
 
-    async def create_session(self, project_id: str, title: Optional[str] = None) -> dict:
+    async def _ensure_project_owner(self, project_id: str, user_id: Optional[str]):
+        """Return a project only when the authenticated user owns it."""
+        if not user_id:
+            raise ResourceNotFoundError("Project", str(project_id))
+        try:
+            project = await self.p_repo.get(UUID(str(project_id)))
+        except (TypeError, ValueError):
+            project = None
+        if not project or str(project.owner_id) != str(user_id):
+            # 404 avoids leaking whether another user's id exists.
+            raise ResourceNotFoundError("Project", str(project_id))
+        return project
+
+    async def create_session(
+        self, project_id: str, title: Optional[str] = None, user_id: Optional[str] = None
+    ) -> dict:
         """Create a new persisted chat session."""
+        await self._ensure_project_owner(project_id, user_id)
         session = await self.repo.create_session(project_id, title or "New Chat")
         return {"id": session.id, "title": session.title, "updated_at": session.updated_at}
 
-    async def list_sessions(self, project_id: str) -> List[dict]:
+    async def list_sessions(self, project_id: str, user_id: Optional[str] = None) -> List[dict]:
         """List all sessions for a project."""
+        await self._ensure_project_owner(project_id, user_id)
         sessions = await self.repo.list_sessions(project_id)
         return [{"id": s.id, "title": s.title, "updated_at": s.updated_at} for s in sessions]
 
-    async def get_history(self, session_id: str) -> List[Dict]:
+    async def get_history(self, session_id: str, user_id: Optional[str] = None) -> List[Dict]:
         """Retrieve structured history for frontend."""
+        session = await self.repo.get_session(session_id)
+        if not session:
+            raise ResourceNotFoundError("Session", session_id)
+        await self._ensure_project_owner(session.project_id, user_id)
         msgs = await self.repo.get_messages(session_id)
         return [
             {
@@ -66,8 +87,12 @@ class CopilotService:
             for m in msgs
         ]
 
-    async def delete_session(self, session_id: str):
+    async def delete_session(self, session_id: str, user_id: Optional[str] = None):
         """Delete (archive) a session."""
+        session = await self.repo.get_session(session_id)
+        if not session:
+            raise ResourceNotFoundError("Session", session_id)
+        await self._ensure_project_owner(session.project_id, user_id)
         await self.repo.delete_session(session_id)
 
     async def stream_chat(
@@ -77,15 +102,14 @@ class CopilotService:
         messages: List[Dict[str, str]],
         model_config: Optional[ModelConfig] = None,
         session_id: Optional[str] = None,
-        runtime: Optional[RuntimeConfig] = None  # [BYOK]
+        runtime: Optional[RuntimeConfig] = None,  # [BYOK]
+        user_id: Optional[str] = None,
     ) -> AsyncGenerator[CopilotStreamChunk, None]:
         """
         Yields structured chunks.
         """
         pid = UUID(project_id)
-        project = await self.p_repo.get(pid)
-        if not project:
-            raise ResourceNotFoundError("Project", project_id)
+        project = await self._ensure_project_owner(project_id, user_id)
 
         # 1. Build Global Context (Upstream Approved)
         # Use current node ID to get everything BEFORE it
@@ -169,6 +193,9 @@ class CopilotService:
         user_content = messages[-1]["content"] if messages else ""
         
         if session_id:
+            session = await self.repo.get_session(session_id)
+            if not session or str(session.project_id) != str(project_id):
+                raise ResourceNotFoundError("Session", session_id)
             # A. Load Persistent History (Exclude current user message to avoid duplication)
             # We fetch DB history FIRST
             db_history = await self.repo.get_messages(session_id, limit=20)

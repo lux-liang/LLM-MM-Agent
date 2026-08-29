@@ -117,7 +117,14 @@ def evaluate_math_modeling(llm, solution_path):
 
 
 def main(args):
-    llm =  partial(gpt, base_url=args.base_url, key=args.key, model='gpt-4o', temperature=0.7, max_tokens=4000)
+    llm = partial(
+        gpt,
+        base_url=args.base_url,
+        key=args.key,
+        model=args.evaluation_model,
+        reasoning_effort=args.reasoning_effort,
+        max_tokens=args.max_tokens,
+    )
     solution_dir = args.solution_dir
     
     for file_name in os.listdir(solution_dir):
@@ -164,7 +171,7 @@ def calculate_average_scores(args):
 
 def visualization(baseline_path):
     results = []
-    args = argparse.Namespace(baseline_path=baseline_path, evaluation_model='gpt-4o', temp=0.7, max_tokens=4000)
+    args = argparse.Namespace(baseline_path=baseline_path, evaluation_model='gpt-5.6-sol', temp=0.7, max_tokens=4000)
     avg_scores = calculate_average_scores(args)
     baseline_name = os.path.basename(os.path.normpath(baseline_path))
     results.append((baseline_name, avg_scores))
@@ -183,11 +190,12 @@ if __name__ == '__main__':
      
     parser = argparse.ArgumentParser(description="Evaluate math modeling solutions.")
     parser.add_argument('--solution_dir', type=str, default="MMBench/example_solution/", help='Path to the directory containing solution files.')
-    parser.add_argument('--evaluation_model', type=str, default='gpt-4o', help='Model to use for evaluation.')
+    parser.add_argument('--evaluation_model', type=str, default=os.getenv('MMAGENT_EVALUATION_MODEL', 'gpt-5.6-sol'), help='gpt-5.6-sol/gpt5.6sol or deepseek-v4-pro/deepseekv4pro')
     parser.add_argument('--temp', type=float, default=0.7, help='Temperature setting for the model.')
     parser.add_argument('--max_tokens', type=int, default=4000, help='Maximum number of tokens for the model.')
-    parser.add_argument('--base_url', type=str, default="https://api.openai.com/v1")
-    parser.add_argument('--key', type=str, default='')
+    parser.add_argument('--base_url', type=str, default=None)
+    parser.add_argument('--key', type=str, default=None, help='Optional API key; provider environment variables are safer.')
+    parser.add_argument('--reasoning_effort', choices=['none', 'low', 'medium', 'high', 'xhigh', 'max'], default=os.getenv('MMAGENT_REASONING_EFFORT', 'high'))
 
     args = parser.parse_args()
 

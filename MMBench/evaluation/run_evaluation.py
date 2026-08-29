@@ -114,13 +114,28 @@ def parse_arguments():
     parser.add_argument(
         '--base_url',
         type=str,
-        default="https://api.openai.com/v1"
+        default=None,
+        help='Optional provider endpoint override; provider defaults are selected from the model.'
     )
 
     parser.add_argument(
         '--key',
         type=str,
-        default=''
+        default=None,
+        help='Optional API key; provider environment variables are safer.'
+    )
+
+    parser.add_argument(
+        '--evaluation_model',
+        type=str,
+        default=os.getenv('MMAGENT_EVALUATION_MODEL', 'gpt-5.6-sol'),
+        help='gpt-5.6-sol/gpt5.6sol or deepseek-v4-pro/deepseekv4pro'
+    )
+
+    parser.add_argument(
+        '--reasoning_effort',
+        choices=['none', 'low', 'medium', 'high', 'xhigh', 'max'],
+        default=os.getenv('MMAGENT_REASONING_EFFORT', 'high')
     )
 
     return parser.parse_args()
@@ -128,6 +143,13 @@ def parse_arguments():
 
 if __name__ == '__main__':
     args = parse_arguments()
-    llm =  partial(gpt, base_url=args.base_url, key=args.key, model='gpt-4o', temperature=0.7, max_tokens=4000)
+    llm = partial(
+        gpt,
+        base_url=args.base_url,
+        key=args.key,
+        model=args.evaluation_model,
+        reasoning_effort=args.reasoning_effort,
+        max_tokens=4000,
+    )
     solution_path = args.solution_file_path
     evaluate_math_modeling(llm,  solution_path)

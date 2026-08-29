@@ -112,8 +112,8 @@ bash demo/scripts/run.sh
 
 ## 👾 当前支持的模型
 
-* **OpenAI**：`gpt-4o`
-* **DeepSeek**：`deepseek-R1`
+* **OpenAI**：`gpt-5.6-sol`（别名：`gpt5.6sol`）
+* **DeepSeek**：`deepseek-v4-pro`（别名：`deepseekv4pro`）
 
 ---
 
@@ -124,13 +124,15 @@ bash demo/scripts/run.sh
 你可以通过以下命令直接运行智能体：
 
 ```bash
-python MMAgent/main.py --key "your_openai_key" --task "task_id"
+export OPENAI_API_KEY="your_openai_key"
+python MMAgent/main.py --model_name gpt-5.6-sol --task "task_id"
 ```
 
 **示例：**
 
 ```bash
-python MMAgent/main.py --key "sk-XXX" --task "2024_C"
+export DEEPSEEK_API_KEY="your_deepseek_key"
+python MMAgent/main.py --model_name deepseek-v4-pro --task "2024_C"
 ```
 
 其中，`task` 参数对应 MM-Bench 中的问题编号（如 `"2024_C"` 表示 2024 年 MCM 的 C 题）。

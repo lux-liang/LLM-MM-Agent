@@ -11,11 +11,13 @@ import shutil
 import httpx
 import os
 import tempfile
+import re
 from pathlib import Path
 from typing import Dict, Optional, Any, List, BinaryIO
 from contextlib import contextmanager
 
 from app.core.config import settings
+from app.core.download_security import asset_url_for_log, safe_asset_download_url
 from app.core.definitions import BlockType
 from app.domain.unified_io import NodeOutput, ContentBlock
 from app.utils.hashing import compute_sha256
@@ -104,17 +106,31 @@ class AssetManager:
 
     def _save_stream_sync(self, url: str) -> Dict[str, Any]:
         """Blocking stream download operation."""
+        url = safe_asset_download_url(url)
+        max_bytes = max(1, int(settings.MAX_ASSET_DOWNLOAD_BYTES))
         # Create temp file
         fd, temp_path = tempfile.mkstemp(dir=self.tmp_dir)
         sha256_hash = hashlib.sha256()
         total_size = 0
 
         try:
-            # Stream download
-            with httpx.stream("GET", url, follow_redirects=True, verify=False) as response:
-                response.raise_for_status()
-                with os.fdopen(fd, "wb") as f:
+            with os.fdopen(fd, "wb") as f:
+                # Redirects are disabled because every new target would need a
+                # fresh allowlist and DNS validation. TLS verification remains on.
+                with httpx.stream(
+                    "GET",
+                    url,
+                    follow_redirects=False,
+                    verify=True,
+                    timeout=60.0,
+                ) as response:
+                    response.raise_for_status()
+                    content_length = response.headers.get("content-length")
+                    if content_length and int(content_length) > max_bytes:
+                        raise ValueError("asset exceeds MAX_ASSET_DOWNLOAD_BYTES")
                     for chunk in response.iter_bytes(chunk_size=8192):
+                        if total_size + len(chunk) > max_bytes:
+                            raise ValueError("asset exceeds MAX_ASSET_DOWNLOAD_BYTES")
                         f.write(chunk)
                         sha256_hash.update(chunk)
                         total_size += len(chunk)
@@ -139,8 +155,8 @@ class AssetManager:
         except Exception as e:
             if os.path.exists(temp_path):
                 os.remove(temp_path)
-            logger.error(f"Failed to stream save from URL {url}: {e}")
-            raise e
+            logger.error("Failed to stream save from URL %s: %s", asset_url_for_log(url), e)
+            raise
 
     @contextmanager
     def open_blob(self, blob_hash: str) -> BinaryIO:
@@ -219,7 +235,7 @@ class AssetManager:
         await loop.run_in_executor(None, self._write_blob_sync, blob_hash, data)
 
     def _get_blob_path(self, blob_hash: str) -> Path:
-        if len(blob_hash) < 4:
+        if not isinstance(blob_hash, str) or not re.fullmatch(r"[0-9a-f]{64}", blob_hash):
             raise ValueError("Invalid hash")
         prefix1 = blob_hash[:2]
         prefix2 = blob_hash[2:4]

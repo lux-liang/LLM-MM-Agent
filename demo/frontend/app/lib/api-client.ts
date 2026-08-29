@@ -9,7 +9,8 @@ const getApiRoot = () => {
 const getStoreState = (key: string) => {
   if (typeof window === 'undefined') return null;
   try {
-    const raw = localStorage.getItem(key);
+    const storage = key === "mm_agent_config_secure" ? sessionStorage : localStorage;
+    const raw = storage.getItem(key);
     if (!raw) return null;
     const parsed = JSON.parse(raw);
     // zustand persist format: {"state": {...}, "version": 0}
@@ -34,7 +35,7 @@ function getBYOKHeaders(): Record<string, string> {
 }
 
 export class ApiError extends Error {
-  constructor(public status: number, message: string, public data?: any) {
+  constructor(public status: number, message: string, public data?: unknown) {
     super(message);
     this.name = "ApiError";
   }

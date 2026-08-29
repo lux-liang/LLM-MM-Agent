@@ -10,6 +10,7 @@ from typing import List, Dict, AsyncGenerator, Optional
 
 from app.core.config import settings
 from app.core.exceptions import ExecutionError
+from app.core.llm_security import safe_llm_base_url
 from app.domain.unified_io import NodeOutput, CopilotStreamChunk
 from app.api.schemas import ModelConfig, RuntimeConfig
 from app.infra.output_parsers import StandardOutputParser
@@ -66,6 +67,11 @@ class ZhipuGateway:
                 base_url = runtime.llm_base_url
             if runtime.llm_model_name:
                 model_name = runtime.llm_model_name
+
+        try:
+            base_url = safe_llm_base_url(base_url, model_name)
+        except ValueError as exc:
+            raise ExecutionError("LLM", f"Unsafe Zhipu base URL: {exc}") from exc
         
         # 2. 检查是否是智谱
         if not self._is_zhipu(base_url):
@@ -149,6 +155,12 @@ class ZhipuGateway:
                 base_url = model_config.baseUrl
             if model_config.temperature is not None:
                 temperature = model_config.temperature
+
+        try:
+            base_url = safe_llm_base_url(base_url, model_name)
+        except ValueError as exc:
+            yield CopilotStreamChunk(content=f"\n\n**[智谱 API 错误]**\n\nUnsafe base URL: {exc}")
+            return
         
         # 检查是否是智谱
         if not self._is_zhipu(base_url):

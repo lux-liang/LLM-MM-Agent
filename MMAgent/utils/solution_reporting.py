@@ -402,7 +402,7 @@ class LatexDocumentAssembler:
                     
         return reordered
     
-    def _add_figure(self, figures: List[str]) -> str:
+    def _add_figure(self, figures: List[str]) -> List[str]:
         """Add a figure to the content"""
         figure_str = []
         for i, figure_path in enumerate(figures):
@@ -417,8 +417,8 @@ class LatexDocumentAssembler:
         return figure_str
 
 
-    def _add_code(self, codes: List[str]) -> str:
-        """
+    def _add_code(self, codes: List[str]) -> List[str]:
+        r"""
 \subsection*{Python Code}
 \subsubsection*{main1.py}
 
@@ -432,7 +432,7 @@ def main1():
             "\\section{Appendix}",
         ]
         for i, code_path in enumerate(codes):
-            with open(code_path, 'r') as f:
+            with open(code_path, 'r', encoding='utf-8', errors='replace') as f:
                 code = f.read()
             name = code_path.split('/')[-1].replace('_', '\\_')
             code_str.append(f"""
@@ -729,4 +729,3 @@ def generate_paper(llm, output_dir, name):
 
     # Generate paper with chapter relevance mapping
     generate_paper_from_json(llm, json_data, metadata, f"{output_dir}/latex", 'solution')
-

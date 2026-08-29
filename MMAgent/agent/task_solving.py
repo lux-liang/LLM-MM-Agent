@@ -6,11 +6,16 @@ from prompt.template import (TASK_ANALYSIS_PROMPT, TASK_RESULT_PROMPT, TASK_ANSW
                              TASK_RESULT_WITH_CODE_PROMPT)
 import sys
 import os
+import signal
 import subprocess
-import selectors
-import tiktoken
+import threading
 import json
 import re
+
+try:
+    import tiktoken
+except ImportError:
+    tiktoken = None
 
 try:
     import json5
@@ -25,54 +30,204 @@ class EnvException(Exception):
         return self.message
     
 
-def execute_script(script_path, work_dir):
+def _drain_capped_output(stream, output_tail, limit):
+    """Continuously drain child output while retaining only a bounded tail."""
     try:
-        device = 0
-        python = "python"
-        cmd = f"CUDA_VISIBLE_DEVICES={device} {python} -u {script_path}"
-        process = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, shell=True, cwd=work_dir)
+        while True:
+            chunk = stream.read(8192)
+            if not chunk:
+                break
+            output_tail.extend(chunk)
+            if len(output_tail) > limit:
+                del output_tail[:-limit]
+    except (OSError, ValueError):
+        pass
 
-        stdout_lines = []
-        stderr_lines = []
 
-        selector = selectors.DefaultSelector()
-        selector.register(process.stdout, selectors.EVENT_READ)
-        selector.register(process.stderr, selectors.EVENT_READ)
+def _create_windows_job(process):
+    """Put a process in a kill-on-close Windows Job Object."""
+    if os.name != "nt":
+        return None
+    import ctypes
+    from ctypes import wintypes
 
-        while process.poll() is None and selector.get_map():
-            events = selector.select(timeout=1)
+    class JOBOBJECT_BASIC_LIMIT_INFORMATION(ctypes.Structure):
+        _fields_ = [
+            ("PerProcessUserTimeLimit", ctypes.c_longlong),
+            ("PerJobUserTimeLimit", ctypes.c_longlong),
+            ("LimitFlags", wintypes.DWORD),
+            ("MinimumWorkingSetSize", ctypes.c_size_t),
+            ("MaximumWorkingSetSize", ctypes.c_size_t),
+            ("ActiveProcessLimit", wintypes.DWORD),
+            ("Affinity", ctypes.c_size_t),
+            ("PriorityClass", wintypes.DWORD),
+            ("SchedulingClass", wintypes.DWORD),
+        ]
 
-            for key, _ in events:
-                line = key.fileobj.readline()
-                if key.fileobj == process.stdout:
-                    print("STDOUT:", line, end =" ")
-                    stdout_lines.append(line)
-                else:
-                    print("STDERR:", line, end =" ")
-                    stderr_lines.append(line)
+    class IO_COUNTERS(ctypes.Structure):
+        _fields_ = [(name, ctypes.c_ulonglong) for name in (
+            "ReadOperationCount",
+            "WriteOperationCount",
+            "OtherOperationCount",
+            "ReadTransferCount",
+            "WriteTransferCount",
+            "OtherTransferCount",
+        )]
 
-        for line in process.stdout:
-            line = line
-            print("STDOUT:", line, end =" ")
-            stdout_lines.append(line)
-        for line in process.stderr:
-            line = line
-            print("STDERR:", line, end =" ")
-            stderr_lines.append(line)
+    class JOBOBJECT_EXTENDED_LIMIT_INFORMATION(ctypes.Structure):
+        _fields_ = [
+            ("BasicLimitInformation", JOBOBJECT_BASIC_LIMIT_INFORMATION),
+            ("IoInfo", IO_COUNTERS),
+            ("ProcessMemoryLimit", ctypes.c_size_t),
+            ("JobMemoryLimit", ctypes.c_size_t),
+            ("PeakProcessMemoryUsed", ctypes.c_size_t),
+            ("PeakJobMemoryUsed", ctypes.c_size_t),
+        ]
+
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel32.CreateJobObjectW.restype = wintypes.HANDLE
+    kernel32.SetInformationJobObject.argtypes = [
+        wintypes.HANDLE,
+        ctypes.c_int,
+        ctypes.c_void_p,
+        wintypes.DWORD,
+    ]
+    kernel32.AssignProcessToJobObject.argtypes = [wintypes.HANDLE, wintypes.HANDLE]
+    job = kernel32.CreateJobObjectW(None, None)
+    if not job:
+        raise ctypes.WinError(ctypes.get_last_error())
+    info = JOBOBJECT_EXTENDED_LIMIT_INFORMATION()
+    info.BasicLimitInformation.LimitFlags = 0x00002000  # KILL_ON_JOB_CLOSE
+    if not kernel32.SetInformationJobObject(
+        job, 9, ctypes.byref(info), ctypes.sizeof(info)
+    ):
+        kernel32.CloseHandle(job)
+        raise ctypes.WinError(ctypes.get_last_error())
+    if not kernel32.AssignProcessToJobObject(job, wintypes.HANDLE(process._handle)):
+        kernel32.CloseHandle(job)
+        raise ctypes.WinError(ctypes.get_last_error())
+    return job
+
+
+def _terminate_process_tree(process, windows_job=None):
+    if os.name == "nt":
+        if windows_job:
+            import ctypes
+            ctypes.WinDLL("kernel32", use_last_error=True).CloseHandle(windows_job)
+            return None
+        subprocess.run(
+            ["taskkill", "/PID", str(process.pid), "/T", "/F"],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            check=False,
+            timeout=5,
+        )
+        return None
+    try:
+        os.killpg(process.pid, signal.SIGKILL)
+    except ProcessLookupError:
+        pass
+    return windows_job
+
+
+def execute_script(script_path, work_dir, timeout=600):
+    """Execute generated code with an argv list and a hard deadline.
+
+    The old implementation used shell=True and had no timeout. The generated
+    file is still untrusted; callers should run this function in a container
+    for production workloads.
+    """
+    work_dir = os.path.realpath(os.path.abspath(work_dir))
+    script = os.path.realpath(os.path.abspath(os.path.join(work_dir, script_path)))
+    try:
+        inside_work_dir = os.path.commonpath([work_dir, script]) == work_dir
+    except ValueError:
+        inside_work_dir = False
+    if not inside_work_dir:
+        raise EnvException("script_path must stay inside work_dir")
+    if not os.path.isfile(script):
+        raise EnvException(f"script does not exist: {script}")
+
+    env = os.environ.copy()
+    env.setdefault("CUDA_VISIBLE_DEVICES", "0")
+    command = [sys.executable, "-u", script]
+    process = None
+    windows_job = None
+    output_stream = None
+    reader = None
+    output_tail = bytearray()
+    try:
+        try:
+            output_limit = int(os.getenv("MMAGENT_MAX_LOG_BYTES", "65536"))
+        except ValueError:
+            output_limit = 65536
+        output_limit = max(4096, min(output_limit, 1048576))
+        creationflags = (
+            subprocess.CREATE_NEW_PROCESS_GROUP if os.name == "nt" else 0
+        )
+        process = subprocess.Popen(
+            command,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=False,
+            shell=False,
+            cwd=work_dir,
+            env=env,
+            start_new_session=(os.name != "nt"),
+            creationflags=creationflags,
+        )
+        output_stream = process.stdout
+        if os.name == "nt":
+            try:
+                windows_job = _create_windows_job(process)
+            except Exception as exc:
+                process.kill()
+                process.wait(timeout=5)
+                raise EnvException(
+                    "could not establish a Windows process-tree boundary: "
+                    + str(exc)[:200]
+                ) from exc
+        reader = threading.Thread(
+            target=_drain_capped_output,
+            args=(output_stream, output_tail, output_limit),
+            daemon=True,
+        )
+        reader.start()
+        try:
+            process.wait(timeout=max(1, int(timeout)))
+        except subprocess.TimeoutExpired:
+            windows_job = _terminate_process_tree(process, windows_job)
+            try:
+                process.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                process.kill()
+            raise EnvException(f"execution timed out after {timeout}s: {script}")
 
         return_code = process.returncode
-
-        if return_code != 0:
-            observation = "".join(stderr_lines)
-        else:
-            observation = "".join(stdout_lines)
-        if observation == "" and return_code == 0:
-            # printed to stderr only
-            observation = "".join(stderr_lines)
-        return "The script has been executed. Here is the output:\n" + observation
-    except Exception as e:
-        print("++++", "Wrong!")
-        raise EnvException(f"Something went wrong in executing {script_path}: {e}. Please check if it is ready to be executed.")
+        # Closing the job/group also removes background descendants that the
+        # generated script attempted to leave behind.
+        windows_job = _terminate_process_tree(process, windows_job)
+        if output_stream:
+            output_stream.close()
+        if reader:
+            reader.join(timeout=2)
+        output = bytes(output_tail).decode("utf-8", errors="replace")
+        status = "success" if return_code == 0 else f"failed (exit {return_code})"
+        return (
+            "The script has been executed. "
+            f"Status: {status}. Return code: {return_code}\n{output}"
+        )
+    except EnvException:
+        raise
+    except Exception as exc:
+        raise EnvException(
+            f"Something went wrong in executing {script}: {str(exc)[:300]}"
+        ) from exc
+    finally:
+        if windows_job:
+            _terminate_process_tree(process, windows_job)
+        if output_stream and not output_stream.closed:
+            output_stream.close()
 
 
 class TaskSolver(BaseAgent):
@@ -125,73 +280,112 @@ class TaskSolver(BaseAgent):
     #         process = self.modeling_improvement(task_description, task_analysis, data_summary, formulas, process, process_critique)
     #     return process
     
+    @staticmethod
+    def _extract_python_code(completion: str) -> str:
+        """Extract a Python program from a model response."""
+        if not isinstance(completion, str) or not completion.strip():
+            raise ValueError("empty code response")
+        fence = chr(96) * 3
+        fence_re = re.escape(fence)
+        match = re.search(
+            fence_re + r"(?:python|py)\s*(.*?)" + fence_re,
+            completion,
+            flags=re.DOTALL | re.IGNORECASE,
+        )
+        if match is None:
+            match = re.search(
+                fence_re + r"\s*(.*?)" + fence_re,
+                completion,
+                flags=re.DOTALL,
+            )
+        code = match.group(1).strip() if match else completion.strip()
+        if code.lower().startswith("python\n"):
+            code = code.split("\n", 1)[1].lstrip()
+        if not code:
+            raise ValueError("model response did not contain executable code")
+        return code
+
+    @staticmethod
+    def _trim_observation(observation: str, max_tokens: int = 2000) -> str:
+        """Keep the tail of a log so the latest exception is retained."""
+        try:
+            if tiktoken is None:
+                raise RuntimeError("tiktoken is unavailable")
+            enc = tiktoken.get_encoding("cl100k_base")
+            token_ids = enc.encode(observation)
+            if len(token_ids) > max_tokens:
+                return enc.decode(token_ids[-max_tokens:])
+        except Exception:
+            pass
+        return observation[-12000:]
+
+    @staticmethod
+    def _execution_succeeded(observation: str) -> bool:
+        return "Status: success. Return code: 0" in (observation or "")
+
+    @staticmethod
+    def _execution_result(observation: str) -> str:
+        return observation.split("\n", 1)[1] if "\n" in observation else observation
+
+    def _generate_code(self, prompt: str) -> str:
+        """Generate and validate code, retrying formatting-only failures."""
+        last_error = None
+        for attempt in range(1, 6):
+            try:
+                return self._extract_python_code(self.llm.generate(prompt))
+            except Exception as exc:
+                last_error = exc
+                print(f"Retry {attempt}/5: model response did not contain Python code")
+        raise EnvException(
+            "Model did not return executable Python after 5 attempts: "
+            + str(last_error)
+        ) from last_error
+
+    @staticmethod
+    def _script_file(work_dir: str, script_name: str) -> str:
+        root = os.path.realpath(os.path.abspath(work_dir))
+        path = os.path.realpath(os.path.abspath(os.path.join(root, script_name)))
+        try:
+            valid = os.path.commonpath([root, path]) == root
+        except ValueError:
+            valid = False
+        if not valid:
+            raise EnvException("script_name must stay inside work_dir")
+        os.makedirs(root, exist_ok=True)
+        return path
+
+    def _write_and_execute(self, code: str, script_name: str, work_dir: str):
+        path = self._script_file(work_dir, script_name)
+        with open(path, "w", encoding="utf-8") as file:
+            file.write(code)
+        try:
+            timeout = int(os.getenv("MMAGENT_CODE_TIMEOUT", "600"))
+        except ValueError:
+            timeout = 600
+        try:
+            observation = execute_script(script_name, work_dir, timeout=max(1, timeout))
+        except EnvException as exc:
+            observation = (
+                "The script has been executed. Status: failed. Return code: -1\n"
+                + str(exc)
+            )
+        return self._trim_observation(observation)
+
     def coding_actor(self, data_file, data_summary, variable_description, task_description: str, task_analysis: str, formulas: str, modeling: str, dependent_file_prompt: str, code_template: str, script_name: str, work_dir: str, user_prompt: str = ''):
         prompt = TASK_CODING_PROMPT.format(data_file=data_file, data_summary=data_summary, variable_description=variable_description, task_description=task_description, task_analysis=task_analysis, modeling_formulas=formulas, modeling_process=modeling, dependent_file_prompt=dependent_file_prompt, code_template=code_template, user_prompt=user_prompt).strip()
-        max_retry = 0
-        while max_retry < 5:
-            max_retry += 1
-            try:
-                completion = self.llm.generate(prompt)
-                new_content = completion.split("```python")[1].split("```")[0].strip()
-                break  
-            except Exception as e:
-                # Format control.
-                print(f"Retry! The code does not start with ```python")
-                continue
-
-        with open(os.path.join(work_dir, script_name), "w", encoding='utf-8') as f:
-            f.write(new_content)
-        
-        # Execute the script.
-        try:
-            observation = execute_script(script_name, work_dir)
-            ## If observation is too long, we only keep the last ~2k tokens.
-            enc = tiktoken.get_encoding("cl100k_base")
-            tokens = len(enc.encode(observation))
-            if tokens >= 2000:
-                observation = observation[:2000]
-                tokens = len(enc.encode(observation))
-        except Exception as e:
-            print(e)
-            input("Ah oh, Got stuck! Press any key to continue.")
-
-        return new_content, observation
+        new_content = self._generate_code(prompt)
+        return new_content, self._write_and_execute(new_content, script_name, work_dir)
     
     def coding_debugger(self, code_template: str, modeling: str, code: str, observation: str, script_name: str, work_dir: str, user_prompt: str = ''):
         
         prompt = TASK_CODING_DEBUG_PROMPT.format(code_template=code_template, modeling_process=modeling, code=code, observation=observation, user_prompt=user_prompt).strip()
         
-        max_retry = 0
-        while max_retry < 5:
-            max_retry += 1
-            try:
-                completion = self.llm.generate(prompt)
-                new_content = completion.split("```python")[1].split("```")[0].strip()
-                break  
-            except Exception as e:
-                # Format control.
-                print(f"Retry! The code does not start with ```python")
-                continue
-
-        with open(os.path.join(work_dir, script_name), "w", encoding='utf-8') as f:
-            f.write(new_content)
-        
-        # Execute the script.
-        try:
-            observation = execute_script(script_name, work_dir)
-            ## If observation is too long, we only keep the last ~2k tokens.
-            enc = tiktoken.get_encoding("cl100k_base")
-            tokens = len(enc.encode(observation))
-            if tokens >= 2000:
-                observation = observation[:2000]
-                tokens = len(enc.encode(observation))
-        except Exception as e:
-            print(e)
-            input("Ah oh, Got stuck! Press any key to continue.")
-
-        return new_content, observation
+        new_content = self._generate_code(prompt)
+        return new_content, self._write_and_execute(new_content, script_name, work_dir)
     
     def coding(self, data_file, data_summary, variable_description, task_description: str, task_analysis: str, formulas: str, modeling: str, dependent_file_prompt: str, code_template: str, script_name: str, work_dir: str, try_num: int = 5, round: int = 1, user_prompt: str = ''):
+        code = ""
+        observation = ""
         for i in range(try_num):
             print("="*10 + f" Try: {i + 1} " + "="*10)
             iteration = 0
@@ -199,15 +393,19 @@ class TaskSolver(BaseAgent):
             while iteration < max_iteration:
                 print("="*10 + f" Iteration: {iteration + 1} " + "="*10)
                 if iteration == 0:
-                    code, observation = self.coding_actor(data_file, data_summary, variable_description, task_description, task_analysis, formulas, modeling, dependent_file_prompt, code_template, script_name, work_dir, user_prompt)
-                    # If the script has been successfully executed: Exit.
-                    if "Traceback (most recent call last):" not in observation and "SyntaxError: invalid syntax" not in observation and "IndentationError" not in observation:
-                        return code, True, observation.split("The script has been executed. Here is the output:\n")[1]
+                    try:
+                        code, observation = self.coding_actor(data_file, data_summary, variable_description, task_description, task_analysis, formulas, modeling, dependent_file_prompt, code_template, script_name, work_dir, user_prompt)
+                    except Exception as exc:
+                        observation = f"The script has been executed. Status: failed. Return code: -1\n{exc}"
+                    if self._execution_succeeded(observation):
+                        return code, True, self._execution_result(observation)
                 else:
-                    code, observation = self.coding_debugger(code_template, modeling, code, observation, script_name, work_dir, user_prompt)
-                    # If the script has been successfully executed: Exit.
-                    if "Traceback (most recent call last):" not in observation and "SyntaxError: invalid syntax" not in observation and "IndentationError" not in observation:
-                        return code, True, observation.split("The script has been executed. Here is the output:\n")[1]
+                    try:
+                        code, observation = self.coding_debugger(code_template, modeling, code, observation, script_name, work_dir, user_prompt)
+                    except Exception as exc:
+                        observation = f"The script has been executed. Status: failed. Return code: -1\n{exc}"
+                    if self._execution_succeeded(observation):
+                        return code, True, self._execution_result(observation)
                 iteration += 1
 
         return code, False, None
