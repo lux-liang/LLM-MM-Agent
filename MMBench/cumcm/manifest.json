@@ -1,5 +1,5 @@
 {
-  "schema_version": "1.0",
+  "schema_version": "1.1",
   "title": "CUMCM reference sources (link-only)",
   "usage_policy": "Metadata and links only. Download or process a paper locally only when you have the right to do so. A repository self-claim is not proof of a national first prize.",
   "sources": [
@@ -28,6 +28,39 @@
       "license_status": "official_public_criteria",
       "download_allowed": false,
       "notes": "Operational review guidance; verify the notice for the target contest year."
+    },
+    {
+      "id": "official-format-2026",
+      "kind": "official_criteria",
+      "title": "全国大学生数学建模竞赛论文格式规范（2026年修订稿）",
+      "url": "https://www.mcm.edu.cn/html_cn/node/4cd596519c9eb9fbd866398f6df0caa3.html",
+      "attachment_url": "https://www.mcm.edu.cn/upload_cn/node/775/cQMeL0YY905244c8bd4b9af832f1699446d8385e.pdf",
+      "sha256": "CECE4BB3A900A0435160032B98EA26E03B0F2D7ECA58424B0D023E26085AED26",
+      "page_count": 2,
+      "year": 2026,
+      "source_authoritative": true,
+      "award_verified": false,
+      "verification_scope": "paper_format_and_submission_requirements_only",
+      "license_status": "official_public_criteria",
+      "download_allowed": false,
+      "notes": "The user-provided PDF matched the official attachment SHA-256 on 2026-09-04. The repository stores only metadata and the structured policy summary, not the PDF."
+    },
+    {
+      "id": "official-ai-policy-2026",
+      "kind": "official_criteria",
+      "title": "全国大学生数学建模竞赛人工智能工具使用规定（2026年试行）",
+      "url": "https://www.mcm.edu.cn/html_cn/node/fef94648f2836ab6cc81586f4c38512b.html",
+      "attachment_url": "https://www.mcm.edu.cn/upload_cn/node/785/Glps6mBh6563c55c45300fede72ddbf6eb33d3a8.pdf",
+      "sha256": "4CF6F30CDD37D6EF2CDB3439C5DBA4D9F207C12D6AAFE24419E81F3C69ACF59A",
+      "page_count": 1,
+      "effective_date": "2026-09-01",
+      "year": 2026,
+      "source_authoritative": true,
+      "award_verified": false,
+      "verification_scope": "ai_tool_use_disclosure_and_governance_requirements_only",
+      "license_status": "official_public_criteria",
+      "download_allowed": false,
+      "notes": "The user-provided PDF matched the official attachment SHA-256 on 2026-09-04. The repository stores only metadata and the structured policy summary, not the PDF."
     },
     {
       "id": "official-awards-2024",

@@ -21,9 +21,25 @@ import os
 import re
 import sys
 import unicodedata
+import zipfile
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Tuple
+
+try:
+    from MMBench.cumcm.compliance_2026 import (
+        POLICY_PATH as COMPLIANCE_POLICY_PATH,
+        assess_2026_compliance,
+        load_policy,
+    )
+except ModuleNotFoundError as exc:  # Preserve direct-script CLI compatibility.
+    if exc.name != "MMBench":
+        raise
+    from compliance_2026 import (  # type: ignore[no-redef]
+        POLICY_PATH as COMPLIANCE_POLICY_PATH,
+        assess_2026_compliance,
+        load_policy,
+    )
 
 try:  # Keep rubric/tests usable without installing the API SDK.
     from openai import OpenAI
@@ -34,6 +50,12 @@ except ImportError:  # pragma: no cover - exercised only in minimal installs
 HERE = Path(__file__).resolve().parent
 RUBRIC_PATH = HERE / "rubric.json"
 MANIFEST_PATH = HERE / "manifest.json"
+MAX_INPUT_FILE_BYTES = 20_000_000
+MAX_PDF_PAGES_TO_EXTRACT = 200
+MAX_EXTRACTED_CHARS_PER_PAGE = 250_000
+MAX_DOCX_MEMBERS = 5_000
+MAX_DOCX_UNCOMPRESSED_BYTES = 250_000_000
+MAX_DOCX_COMPRESSION_RATIO = 1_000
 
 MODEL_ALIASES = {
     "deepseekv4pro": "deepseek-v4-pro",
@@ -115,7 +137,7 @@ def _extract_json(text: str) -> Dict[str, Any]:
     raise ValueError("model response did not contain a JSON object")
 
 
-def _read_pdf(path: Path) -> List[Dict[str, Any]]:
+def _read_pdf(path: Path) -> Tuple[List[Dict[str, Any]], List[str], int]:
     try:
         from pypdf import PdfReader
     except ImportError as exc:
@@ -124,9 +146,65 @@ def _read_pdf(path: Path) -> List[Dict[str, Any]]:
         ) from exc
     reader = PdfReader(str(path))
     pages = []
-    for number, page in enumerate(reader.pages, start=1):
-        pages.append({"page": number, "text": page.extract_text() or ""})
-    return pages
+    warnings: List[str] = []
+    page_count = len(reader.pages)
+    if page_count > MAX_PDF_PAGES_TO_EXTRACT:
+        warnings.append(
+            f"PDF extraction is incomplete: limited to the first {MAX_PDF_PAGES_TO_EXTRACT} pages"
+        )
+    for index in range(min(page_count, MAX_PDF_PAGES_TO_EXTRACT)):
+        number = index + 1
+        page = reader.pages[index]
+        try:
+            width_points = round(float(page.mediabox.width), 2)
+            height_points = round(float(page.mediabox.height), 2)
+        except Exception:
+            width_points = None
+            height_points = None
+        try:
+            extracted_text = page.extract_text() or ""
+        except Exception:
+            extracted_text = ""
+            warnings.append(f"PDF page {number} text extraction is incomplete")
+        text_truncated = len(extracted_text) > MAX_EXTRACTED_CHARS_PER_PAGE
+        if text_truncated:
+            extracted_text = extracted_text[:MAX_EXTRACTED_CHARS_PER_PAGE]
+        pages.append(
+            {
+                "page": number,
+                "text": extracted_text,
+                "width_points": width_points,
+                "height_points": height_points,
+                "text_truncated": text_truncated,
+            }
+        )
+    if any(item["text_truncated"] for item in pages):
+        warnings.append("one or more PDF pages exceeded the safe extracted-text limit")
+    return pages, warnings, page_count
+
+
+def _docx_container_issue(path: Path) -> Optional[str]:
+    """Reject malformed or expansion-heavy DOCX containers before parsing XML."""
+    try:
+        with zipfile.ZipFile(path, "r") as archive:
+            infos = archive.infolist()
+            if len(infos) > MAX_DOCX_MEMBERS:
+                return "too many DOCX members"
+            total_uncompressed = sum(max(0, int(item.file_size)) for item in infos)
+            total_compressed = sum(max(0, int(item.compress_size)) for item in infos)
+            if total_uncompressed > MAX_DOCX_UNCOMPRESSED_BYTES:
+                return "DOCX uncompressed size exceeds the safe parse limit"
+            if total_uncompressed / max(1, total_compressed) > MAX_DOCX_COMPRESSION_RATIO:
+                return "DOCX compression ratio exceeds the safe parse limit"
+            if any(
+                name.replace("\\", "/").startswith("/")
+                or ".." in Path(name.replace("\\", "/")).parts
+                for name in (item.filename for item in infos)
+            ):
+                return "DOCX contains an unsafe member path"
+    except (OSError, zipfile.BadZipFile, RuntimeError, ValueError):
+        return "DOCX container could not be safely inspected"
+    return None
 
 
 def read_document(path: os.PathLike[str] | str, max_chars: int = 60000) -> Dict[str, Any]:
@@ -135,39 +213,61 @@ def read_document(path: os.PathLike[str] | str, max_chars: int = 60000) -> Dict[
     if not file_path.is_file():
         raise FileNotFoundError(file_path)
     suffix = file_path.suffix.lower()
+    supported_suffixes = {".pdf", ".doc", ".docx", ".md", ".markdown", ".txt", ".tex", ".rst"}
+    if suffix not in supported_suffixes:
+        raise ValueError("supported paper formats: .pdf, .docx, .md, .txt, .tex, .rst")
+    file_size = file_path.stat().st_size
     extraction_warnings: List[str] = []
     page_numbers_reliable = suffix == ".pdf"
-    if suffix == ".pdf":
-        pages = _read_pdf(file_path)
+    document_page_count: Optional[int] = None
+    if file_size > MAX_INPUT_FILE_BYTES:
+        pages = []
+        extraction_warnings.append(
+            "document exceeds the 20,000,000-byte safe parse limit; extraction incomplete"
+        )
+        page_numbers_reliable = False
+    elif suffix == ".pdf":
+        pages, pdf_warnings, document_page_count = _read_pdf(file_path)
+        extraction_warnings.extend(pdf_warnings)
         empty_pages = sum(not str(item.get("text", "")).strip() for item in pages)
-        if pages and empty_pages / len(pages) >= 0.25:
+        if pages and empty_pages:
             extraction_warnings.append(
-                "at least 25% of PDF pages had no extractable text; OCR or formulas may be missing"
+                "one or more PDF pages had no extractable text; OCR or image content extraction is incomplete"
             )
     elif suffix == ".docx":
-        try:
-            from docx import Document
-        except ImportError as exc:
-            raise RuntimeError(
-                "DOCX evaluation needs python-docx; install it with `pip install python-docx`"
-            ) from exc
-        document = Document(str(file_path))
-        blocks = [p.text for p in document.paragraphs if p.text.strip()]
-        for table in document.tables:
-            for row in table.rows:
-                cells = [cell.text.strip() for cell in row.cells]
-                if any(cells):
-                    blocks.append(" | ".join(cells))
-        text = "\n".join(blocks)
-        pages = [{"page": 1, "text": text}]
+        container_issue = _docx_container_issue(file_path)
+        if container_issue:
+            pages = []
+            extraction_warnings.append(
+                f"DOCX extraction incomplete: {container_issue}"
+            )
+        else:
+            try:
+                from docx import Document
+            except ImportError as exc:
+                raise RuntimeError(
+                    "DOCX evaluation needs python-docx; install it with `pip install python-docx`"
+                ) from exc
+            document = Document(str(file_path))
+            blocks = [p.text for p in document.paragraphs if p.text.strip()]
+            for table in document.tables:
+                for row in table.rows:
+                    cells = [cell.text.strip() for cell in row.cells]
+                    if any(cells):
+                        blocks.append(" | ".join(cells))
+            text = "\n".join(blocks)
+            pages = [{"page": 1, "text": text}]
         extraction_warnings.append(
             "DOCX has no reliable rendered page map; equations, text boxes, and layout may be incomplete"
+        )
+    elif suffix == ".doc":
+        pages = []
+        extraction_warnings.append(
+            "legacy Word DOC extraction is unsupported; extraction incomplete"
         )
     elif suffix in {".md", ".markdown", ".txt", ".tex", ".rst"}:
         pages = [{"page": 1, "text": file_path.read_text(encoding="utf-8", errors="replace")}]
         extraction_warnings.append("plain-text formats do not provide reliable rendered page numbers")
-    else:
-        raise ValueError("supported paper formats: .pdf, .docx, .md, .txt, .tex, .rst")
 
     chunks = []
     for item in pages:
@@ -188,6 +288,10 @@ def read_document(path: os.PathLike[str] | str, max_chars: int = 60000) -> Dict[
         extraction_warnings.append("no extractable document text was found")
     return {
         "path": str(file_path),
+        "file_name": file_path.name,
+        "file_size_bytes": file_size,
+        "page_count": document_page_count if document_page_count is not None else len(pages),
+        "extracted_page_count": len(pages),
         "pages": pages,
         "text": full_text,
         "format": suffix.lstrip("."),
@@ -197,7 +301,9 @@ def read_document(path: os.PathLike[str] | str, max_chars: int = 60000) -> Dict[
 
 
 def load_local_references(
-    directory: Optional[os.PathLike[str] | str], max_chars_each: int = 7000
+    directory: Optional[os.PathLike[str] | str],
+    max_chars_each: int = 7000,
+    max_files: int = 8,
 ) -> List[Dict[str, str]]:
     """Read user-provided local exemplars; never fetches URLs from the manifest."""
     if not directory:
@@ -207,6 +313,8 @@ def load_local_references(
         raise NotADirectoryError(root)
     references: List[Dict[str, str]] = []
     for path in sorted(root.rglob("*")):
+        if len(references) >= max_files:
+            break
         if not path.is_file() or path.suffix.lower() not in {
             ".pdf",
             ".docx",
@@ -217,11 +325,25 @@ def load_local_references(
             ".rst",
         }:
             continue
+        # A local corpus is untrusted input.  Do not let symlinks escape the
+        # directory the user explicitly selected.
+        if path.is_symlink():
+            continue
+        resolved = path.resolve()
         try:
-            document = read_document(path, max_chars=max_chars_each)
+            resolved.relative_to(root)
+        except ValueError:
+            continue
+        if resolved.stat().st_size > 20_000_000:
+            references.append({"name": path.name, "text": "[unreadable: file exceeds 20 MB]"})
+            continue
+        try:
+            document = read_document(resolved, max_chars=max_chars_each)
             references.append({"name": path.name, "text": document["text"]})
         except Exception as exc:
-            references.append({"name": path.name, "text": f"[unreadable: {exc}]"})
+            references.append(
+                {"name": path.name, "text": f"[unreadable: {type(exc).__name__}]"}
+            )
     return references
 
 
@@ -257,6 +379,49 @@ def _reference_context(
     return "\n\n".join(blocks)
 
 
+def _compliance_prompt_context(document: Dict[str, Any]) -> str:
+    """Render only path-safe deterministic findings for the model prompt.
+
+    The language model may use these facts when suggesting revisions, but it
+    is never allowed to overwrite their statuses in the final report.
+    """
+    assessment = document.get("compliance")
+    if not isinstance(assessment, dict):
+        return "2026 deterministic compliance precheck: not available"
+    profile = assessment.get("policy_profile", {})
+    format_assessment = assessment.get("format_assessment", {})
+    ai_assessment = assessment.get("ai_usage_assessment", {})
+    input_safety = assessment.get("input_safety_assessment", {})
+    findings = []
+    for group in (format_assessment, ai_assessment, input_safety):
+        for check in group.get("checks", []) if isinstance(group, dict) else []:
+            if not isinstance(check, dict) or check.get("status") not in {"FAIL", "UNKNOWN"}:
+                continue
+            findings.append(
+                {
+                    "check_id": check.get("check_id") or check.get("id"),
+                    "status": check.get("status"),
+                }
+            )
+    return json.dumps(
+        {
+            "profile_id": profile.get("profile_id") if isinstance(profile, dict) else None,
+            "overall_status": assessment.get("overall_status", "UNKNOWN"),
+            "format_status": format_assessment.get("status", "UNKNOWN")
+            if isinstance(format_assessment, dict)
+            else "UNKNOWN",
+            "ai_usage_status": ai_assessment.get("status", "UNKNOWN")
+            if isinstance(ai_assessment, dict)
+            else "UNKNOWN",
+            "input_safety_status": input_safety.get("status", "UNKNOWN")
+            if isinstance(input_safety, dict)
+            else "UNKNOWN",
+            "findings_requiring_attention": findings[:30],
+        },
+        ensure_ascii=False,
+    )
+
+
 def build_prompt(
     document: Dict[str, Any],
     rubric: Dict[str, Any],
@@ -281,6 +446,9 @@ def build_prompt(
 {json.dumps(dimensions, ensure_ascii=False, indent=2)}
 格式检查满分10；格式分不并入四维总分。请重点检查假设、变量/单位、可复现性、
 敏感性/误差、对所有子问题的回答、图表和引用。
+这里的学习型格式分也不等于 2026 官方合规结论。下方确定性合规状态是只读事实，
+你可以据此提出修改建议，但不得重写、淡化或用论文质量分覆盖它：
+{_compliance_prompt_context(document)}
 
 只返回一个 JSON 对象，字段必须包括：
 {{
@@ -307,7 +475,7 @@ def build_prompt(
 {_reference_context(manifest, local_references)}
 </UNTRUSTED_REFERENCE_DATA>
 
-待评论文路径：{document["path"]}
+待评论文文件名：{document.get("file_name") or Path(document["path"]).name}
 <UNTRUSTED_PAPER_DATA>
 待评论文文本：
 {document["text"]}
@@ -534,6 +702,104 @@ def _score_band(overall: float) -> str:
     return "not ready as an exemplar"
 
 
+def _compliance_fields(document_meta: Dict[str, Any]) -> Tuple[Dict[str, Any], bool]:
+    """Return stable report fields without trusting similarly named model output."""
+    assessment = document_meta.get("compliance")
+    if not isinstance(assessment, dict):
+        return (
+            {
+                "policy_profile": {
+                    "profile_id": "unassessed",
+                    "status": "UNKNOWN",
+                    "sources": [],
+                    "checks": [],
+                },
+                "format_assessment": {"status": "UNKNOWN", "checks": []},
+                "ai_usage_assessment": {
+                    "status": "UNKNOWN",
+                    "declared_usage": "UNKNOWN",
+                    "checks": [],
+                },
+                "input_safety_assessment": {"status": "UNKNOWN", "checks": []},
+                "compliance_status": "UNKNOWN",
+                "adjudication": {
+                    "rule_violation_candidate": False,
+                    "disqualification_candidate": False,
+                    "human_adjudication_required": True,
+                },
+            },
+            False,
+        )
+
+    profile = assessment.get("policy_profile")
+    format_assessment = assessment.get("format_assessment")
+    ai_assessment = assessment.get("ai_usage_assessment")
+    input_safety = assessment.get("input_safety_assessment")
+    adjudication = assessment.get("adjudication")
+    overall_status = str(assessment.get("overall_status", "UNKNOWN")).upper()
+    if overall_status not in {"PASS", "FAIL", "UNKNOWN", "NOT_APPLICABLE"}:
+        overall_status = "UNKNOWN"
+    if not isinstance(profile, dict):
+        profile = {"profile_id": "CUMCM-2026", "status": "UNKNOWN", "checks": []}
+    if not isinstance(format_assessment, dict):
+        format_assessment = {"status": "UNKNOWN", "checks": []}
+    if not isinstance(ai_assessment, dict):
+        ai_assessment = {"status": "UNKNOWN", "declared_usage": "UNKNOWN", "checks": []}
+    if not isinstance(input_safety, dict):
+        input_safety = {"status": "UNKNOWN", "checks": []}
+    if not isinstance(adjudication, dict):
+        adjudication = {
+            "rule_violation_candidate": overall_status == "FAIL",
+            "disqualification_candidate": False,
+            "human_adjudication_required": overall_status != "PASS",
+        }
+    else:
+        adjudication = dict(adjudication)
+        # Neither the compliance engine nor an LLM may automatically cancel an
+        # award.  That consequence belongs to the competition committee.
+        adjudication["disqualification_candidate"] = False
+    return (
+        {
+            "policy_profile": profile,
+            "format_assessment": format_assessment,
+            "ai_usage_assessment": ai_assessment,
+            "input_safety_assessment": input_safety,
+            "compliance_status": overall_status,
+            "adjudication": adjudication,
+        },
+        True,
+    )
+
+
+def _compliance_review_reasons(fields: Dict[str, Any]) -> List[str]:
+    reasons: List[str] = []
+    overall_status = str(fields.get("compliance_status", "UNKNOWN"))
+    if overall_status != "PASS":
+        reasons.append(f"2026 compliance status: {overall_status}")
+    for label, field_name in (
+        ("format", "format_assessment"),
+        ("AI usage", "ai_usage_assessment"),
+        ("input safety", "input_safety_assessment"),
+    ):
+        group = fields.get(field_name, {})
+        if not isinstance(group, dict):
+            continue
+        for status in ("FAIL", "UNKNOWN"):
+            check_ids = [
+                str(item.get("check_id") or item.get("id"))
+                for item in group.get("checks", [])
+                if isinstance(item, dict) and item.get("status") == status
+            ]
+            if check_ids:
+                reasons.append(
+                    f"2026 {label} checks {status}: " + ", ".join(check_ids[:20])
+                )
+    adjudication = fields.get("adjudication", {})
+    if isinstance(adjudication, dict) and adjudication.get("human_adjudication_required"):
+        reasons.append("2026 rules require human adjudication")
+    return reasons
+
+
 def normalize_report(
     raw: Dict[str, Any],
     model: str,
@@ -556,6 +822,7 @@ def normalize_report(
     missing = []
     validation_errors = []
     document_meta = document_meta or {}
+    compliance_fields, compliance_evaluated = _compliance_fields(document_meta)
     page_numbers_reliable = bool(
         document_meta.get("page_numbers_reliable", bool(paper_pages))
     )
@@ -767,10 +1034,29 @@ def normalize_report(
     if raw.get("human_review_required") is True:
         reasons.append("model requested human review")
 
-    return {
-        "schema_version": "1.0",
+    quality_review_reasons = list(dict.fromkeys(reasons))
+    compliance_review_reasons = (
+        _compliance_review_reasons(compliance_fields)
+        if compliance_evaluated
+        else ["2026 compliance was not evaluated"]
+    )
+    compliance_review_reasons = list(dict.fromkeys(compliance_review_reasons))
+    reasons = list(
+        dict.fromkeys(quality_review_reasons + compliance_review_reasons)
+    )
+    quality_review_required = bool(quality_review_reasons)
+    compliance_review_required = bool(compliance_review_reasons)
+    human_review_required = quality_review_required or compliance_review_required
+    submission_ready = bool(
+        compliance_evaluated
+        and compliance_fields["compliance_status"] == "PASS"
+        and not compliance_review_required
+    )
+
+    report = {
+        "schema_version": "1.1",
         "model": normalize_model_name(model),
-        "paper": paper_path,
+        "paper": Path(str(paper_path)).name if paper_path else "",
         "document_format": document_meta.get("format"),
         "evidence_page_mapping_reliable": page_numbers_reliable,
         "extraction_warnings": extraction_warnings,
@@ -787,11 +1073,18 @@ def normalize_report(
         "integrity_flags": integrity_flags,
         "improvements": _as_strings(raw.get("improvements")),
         "confidence": confidence,
-        "human_review_required": bool(reasons),
+        "quality_review_required": quality_review_required,
+        "quality_review_reasons": quality_review_reasons,
+        "compliance_review_required": compliance_review_required,
+        "compliance_review_reasons": compliance_review_reasons,
+        "human_review_required": human_review_required,
         "human_review_reasons": reasons,
+        "submission_ready": submission_ready,
         "score_band": _score_band(overall),
         "disclaimer": "This is a learning score, not an official contest grade or prize prediction.",
     }
+    report.update(compliance_fields)
+    return report
 
 
 def _merge_reports(reports: Sequence[Dict[str, Any]], models: Sequence[str]) -> Dict[str, Any]:
@@ -850,18 +1143,59 @@ def _merge_reports(reports: Sequence[Dict[str, Any]], models: Sequence[str]) -> 
             )
         )
     merged["model_reports"] = list(reports)
-    reasons = list(
+    quality_reasons = list(
         dict.fromkeys(
             reason
             for report in reports
-            for reason in report.get("human_review_reasons", [])
+            for reason in report.get(
+                "quality_review_reasons", report.get("human_review_reasons", [])
+            )
         )
     )
     if disagreement >= 6:
-        reasons.append(f"model disagreement is {disagreement:.2f} points on a dimension")
-    merged["human_review_reasons"] = list(dict.fromkeys(reasons))
+        quality_reasons.append(
+            f"model disagreement is {disagreement:.2f} points on a dimension"
+        )
+    quality_reasons = list(dict.fromkeys(quality_reasons))
+    compliance_reasons = list(
+        dict.fromkeys(
+            reason
+            for report in reports
+            for reason in report.get("compliance_review_reasons", [])
+        )
+    )
+    merged["quality_review_reasons"] = quality_reasons
+    merged["quality_review_required"] = bool(quality_reasons)
+    merged["compliance_review_reasons"] = compliance_reasons
+    merged["compliance_review_required"] = bool(compliance_reasons)
+    merged["human_review_reasons"] = list(
+        dict.fromkeys(quality_reasons + compliance_reasons)
+    )
     merged["human_review_required"] = bool(merged["human_review_reasons"])
+    merged["submission_ready"] = bool(
+        merged.get("compliance_status") == "PASS"
+        and not merged["compliance_review_required"]
+    )
     return merged
+
+
+def _finalize_report(
+    result: Dict[str, Any], manifest: Sequence[Dict[str, Any]]
+) -> Dict[str, Any]:
+    result["reference_sources"] = [
+        {
+            "id": item.get("id"),
+            "title": item.get("title"),
+            "url": item.get("url"),
+            "source_authoritative": bool(item.get("source_authoritative", False)),
+            "award_verified": bool(item.get("award_verified", False)),
+            "verification_scope": item.get("verification_scope"),
+            "license_status": item.get("license_status"),
+        }
+        for item in manifest
+    ]
+    result["generated_at"] = datetime.now(timezone.utc).isoformat()
+    return result
 
 
 def evaluate_document(
@@ -877,6 +1211,9 @@ def evaluate_document(
     reasoning_effort: Optional[str] = "high",
     manifest_path: Optional[Path] = None,
     references_dir: Optional[Path] = None,
+    policy_path: Optional[Path] = None,
+    supporting_materials: Optional[Path] = None,
+    ai_details: Optional[Path] = None,
     ensemble: bool = False,
     dry_run: bool = False,
 ) -> Dict[str, Any]:
@@ -884,6 +1221,13 @@ def evaluate_document(
     rubric = load_rubric()
     manifest = load_reference_manifest(manifest_path)
     local_references = load_local_references(references_dir)
+    policy = load_policy(policy_path or COMPLIANCE_POLICY_PATH)
+    document["compliance"] = assess_2026_compliance(
+        document,
+        supporting_materials=supporting_materials,
+        ai_details=ai_details,
+        policy=policy,
+    )
     if any(
         _deterministic_integrity_flags(reference.get("text", ""))
         for reference in local_references
@@ -896,8 +1240,14 @@ def evaluate_document(
         )
     prompt = build_prompt(document, rubric, manifest, local_references)
     models = ["gpt-5.6-sol", "deepseek-v4-pro"] if ensemble else [model]
-    if dry_run:
+    no_extractable_text = not _normalize_evidence_text(document.get("text", ""))
+    if dry_run or no_extractable_text:
         empty_scores = {item["id"]: 0 for item in rubric["dimensions"]}
+        local_reason = (
+            "dry_run: no model was called"
+            if dry_run
+            else "no extractable paper text: no model was called"
+        )
         result = normalize_report(
             {
                 "dimension_scores": empty_scores,
@@ -909,19 +1259,27 @@ def evaluate_document(
                 "improvements": [],
                 "confidence": 0,
             },
-            "dry-run",
+            "dry-run" if dry_run else "unscored",
             str(document["path"]),
             paper_text=document["text"],
             paper_pages=document["pages"],
             document_meta=document,
         )
         result["human_review_required"] = True
-        result["human_review_reasons"] = list(
+        result["quality_review_reasons"] = list(
             dict.fromkeys(
-                result.get("human_review_reasons", []) + ["dry_run: no model was called"]
+                result.get("quality_review_reasons", [])
+                + [local_reason]
             )
         )
-        return result
+        result["quality_review_required"] = True
+        result["human_review_reasons"] = list(
+            dict.fromkeys(
+                result["quality_review_reasons"]
+                + result.get("compliance_review_reasons", [])
+            )
+        )
+        return _finalize_report(result, manifest)
 
     reports = []
     errors = []
@@ -952,30 +1310,29 @@ def evaluate_document(
                 )
             )
         except Exception as exc:
-            errors.append(f"{normalize_model_name(selected_model)}: {exc}")
+            errors.append(
+                f"{normalize_model_name(selected_model)}: {type(exc).__name__}"
+            )
     if not reports:
         raise RuntimeError("all model calls failed: " + " | ".join(errors))
     result = _merge_reports(reports, models)
     if errors:
+        result["quality_review_required"] = True
+        result["quality_review_reasons"] = list(
+            dict.fromkeys(
+                result.get("quality_review_reasons", [])
+                + ["partial ensemble failure"]
+            )
+        )
         result["human_review_required"] = True
         result["human_review_reasons"] = list(
-            dict.fromkeys(result.get("human_review_reasons", []) + ["partial ensemble failure"])
+            dict.fromkeys(
+                result["quality_review_reasons"]
+                + result.get("compliance_review_reasons", [])
+            )
         )
         result["errors"] = errors
-    result["reference_sources"] = [
-        {
-            "id": item.get("id"),
-            "title": item.get("title"),
-            "url": item.get("url"),
-            "source_authoritative": bool(item.get("source_authoritative", False)),
-            "award_verified": bool(item.get("award_verified", False)),
-            "verification_scope": item.get("verification_scope"),
-            "license_status": item.get("license_status"),
-        }
-        for item in manifest
-    ]
-    result["generated_at"] = datetime.now(timezone.utc).isoformat()
-    return result
+    return _finalize_report(result, manifest)
 
 
 def _parser() -> argparse.ArgumentParser:
@@ -999,6 +1356,24 @@ def _parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--reference-manifest", type=Path, default=MANIFEST_PATH)
     parser.add_argument("--references-dir", type=Path, default=None)
+    parser.add_argument(
+        "--policy",
+        type=Path,
+        default=COMPLIANCE_POLICY_PATH,
+        help="2026 compliance policy profile (defaults to bundled policy_2026.json)",
+    )
+    parser.add_argument(
+        "--supporting-materials",
+        type=Path,
+        default=None,
+        help="optional ZIP/RAR submission package or review directory; contents are never executed",
+    )
+    parser.add_argument(
+        "--ai-details",
+        type=Path,
+        default=None,
+        help="optional review copy of the required AI usage details PDF",
+    )
     parser.add_argument("--ensemble", action="store_true", help="score with both supported models")
     parser.add_argument("--dry-run", action="store_true", help="extract and validate without an API call")
     parser.add_argument("--output", type=Path, default=None, help="write JSON report to this path")
@@ -1027,11 +1402,14 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             reasoning_effort=args.reasoning_effort,
             manifest_path=args.reference_manifest,
             references_dir=args.references_dir,
+            policy_path=args.policy,
+            supporting_materials=args.supporting_materials,
+            ai_details=args.ai_details,
             ensemble=args.ensemble,
             dry_run=args.dry_run,
         )
     except Exception as exc:
-        print(f"evaluation failed: {exc}", file=sys.stderr)
+        print(f"evaluation failed: {type(exc).__name__}", file=sys.stderr)
         return 2
     rendered = json.dumps(result, ensure_ascii=False, indent=2)
     if args.output:

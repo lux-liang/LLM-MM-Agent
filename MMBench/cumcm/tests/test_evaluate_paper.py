@@ -19,7 +19,7 @@ class EvaluatorTests(unittest.TestCase):
         value = _extract_json("answer: " + chr(96) * 3 + "json\n{\"x\": 1}\n" + chr(96) * 3)
         self.assertEqual(value, {"x": 1})
 
-    def test_normalize_scores_and_human_gate(self):
+    def test_normalize_scores_and_unassessed_compliance_gate(self):
         raw = {
             "dimension_scores": {
                 "assumptions_reasonableness": {"score": 20, "feedback": "a"},
@@ -34,7 +34,10 @@ class EvaluatorTests(unittest.TestCase):
         result = normalize_report(raw, "gpt5.6sol", "paper.md")
         self.assertEqual(result["dimension_scores"]["assumptions_reasonableness"], 20)
         self.assertEqual(result["overall_score"], 80)
-        self.assertFalse(result["human_review_required"])
+        self.assertFalse(result["quality_review_required"])
+        self.assertTrue(result["compliance_review_required"])
+        self.assertTrue(result["human_review_required"])
+        self.assertFalse(result["submission_ready"])
 
     def test_dry_run_is_local_and_requires_review(self):
         with tempfile.TemporaryDirectory() as directory:

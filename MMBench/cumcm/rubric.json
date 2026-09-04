@@ -1,5 +1,5 @@
 {
-  "version": "1.0",
+  "version": "1.1",
   "title": "CUMCM paper learning rubric",
   "source_basis": [
     {
@@ -15,9 +15,40 @@
     {
       "name": "全国大学生数学建模竞赛全国奖项评阅工作规范（2023年修订稿）",
       "url": "https://www.mcm.edu.cn/html_cn/node/b1f48689659f0660e80a2d6279d7b37d.html"
+    },
+    {
+      "name": "全国大学生数学建模竞赛论文格式规范（2026年修订稿）",
+      "url": "https://www.mcm.edu.cn/html_cn/node/4cd596519c9eb9fbd866398f6df0caa3.html",
+      "role": "unscored_compliance_policy",
+      "policy_profile": "policy_2026.json"
+    },
+    {
+      "name": "全国大学生数学建模竞赛人工智能工具使用规定（2026年试行）",
+      "url": "https://www.mcm.edu.cn/html_cn/node/fef94648f2836ab6cc81586f4c38512b.html",
+      "role": "unscored_compliance_policy",
+      "policy_profile": "policy_2026.json"
     }
   ],
-  "scoring_note": "The four equal weights below are an operational learning rubric, not an official prize cutoff or judging formula.",
+  "scoring_note": "The four equal weights below are an operational learning rubric, not an official prize cutoff or judging formula. Format and AI-policy compliance are reported separately as statuses and never add to or subtract from the 0-100 quality score.",
+  "assessment_boundaries": {
+    "quality": {
+      "scored": true,
+      "operational_total": 100,
+      "official_score": false
+    },
+    "policy_compliance": {
+      "scored": false,
+      "profile": "policy_2026.json",
+      "statuses": [
+        "PASS",
+        "FAIL",
+        "UNKNOWN",
+        "NOT_APPLICABLE"
+      ],
+      "human_decision_required": true,
+      "note": "A quality score cannot prove compliance, and a compliance status is not a prize prediction."
+    }
+  },
   "dimensions": [
     {
       "id": "assumptions_reasonableness",
@@ -61,7 +92,11 @@
     }
   ],
   "format_checks": {
-    "max_score": 10,
+    "scoring_role": "legacy_learning_feedback_only",
+    "max_learning_score": 10,
+    "official_score": false,
+    "compliance_source": "policy_2026.json",
+    "note": "These observations are retained for backward-compatible writing feedback. The official 2026 format decision must use the separate policy status and must not be inferred from this learning score.",
     "items": [
       "problem restatement and assumptions are present",
       "symbols and units are defined before use",
