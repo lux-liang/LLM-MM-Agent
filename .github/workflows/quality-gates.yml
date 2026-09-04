@@ -1,0 +1,48 @@
+name: Quality gates
+
+on:
+  push:
+    branches: [main, "codex/**"]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  compile-and-test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Compile changed Python surfaces
+        run: python -m compileall -q MMAgent MMBench demo/backend/app
+      - name: Run deterministic evaluator and routing tests
+        env:
+          PYTHONPATH: .
+        run: python -m unittest discover -s MMBench/cumcm/tests -v
+
+  frontend-build:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: demo/frontend
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: demo/frontend/package-lock.json
+      - run: npm ci --ignore-scripts
+      - name: Lint security-sensitive configuration surfaces
+        run: >-
+          npx eslint
+          app/hooks/useSecureConfig.ts
+          app/components/shared/SettingsModal.tsx
+          app/lib/api-client.ts
+          app/lib/sse-client.ts
+          lib/api.ts
+      - run: npx tsc --noEmit
+      - run: npm run build
