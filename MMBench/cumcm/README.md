@@ -18,6 +18,22 @@
     python -m MMBench.cumcm.evaluate_paper --paper samples/my_paper.md --dry-run
     python -m MMBench.cumcm.score_references --reports-dir reports --output reports/leaderboard.csv
 
+### CUMCM 2026 B 题前两问：证据驱动写作与可视化
+
+`q1_q2_pipeline.py` 将前两问的数值证据、TeX 正文审计和图表生成固定成一个可复现入口。它不调用模型接口，也不写入密钥：先拒绝缺失或非有限数字，再生成带有“主模型/辅助模型”边界的编辑提示，最后输出三张矢量 PDF 及 PNG 预览。主模型必须承担有界误差下的鲁棒极小极大保证；局部条带、等效半径和 CRLB 只能作为解释性辅助，有限外层搜索不能写成连续空间全局最优。
+
+在已经准备好结果 JSON 和论文 TeX 的情况下，可以运行：
+
+    python -m MMBench.cumcm.q1_q2_pipeline `
+      --results path/to/Math-Modeling/reports/q1_q2_dual_model_results.json `
+      --q1-tex path/to/Cumcm/contents/sections/b_q1_q2.tex `
+      --q1-tex path/to/Cumcm/contents/sections/b_q1_q2_validation.tex `
+      --output path/to/Cumcm/figures/b_q1_q2 `
+      --manifest path/to/Cumcm/figures/b_q1_q2/mmagent_q1_q2_manifest.json `
+      --prompt path/to/Cumcm/figures/b_q1_q2/mmagent_q1_q2_editor_prompt.txt
+
+清单记录输入结果的 SHA-256、匹配到的论文主张以及每张图的 PDF/PNG SHA-256。绘图采用 Matplotlib 的 Agg 后端和确定性输入，适合在提交前逐页复核；生成的编辑提示只是草稿，数字、推导、引用、AI 使用披露和最终格式仍须由队伍人工核验。
+
 `--policy`、`--supporting-materials` 和 `--ai-details` 是 2026 合规检查接口：分别指定版本化规则、支撑材料包和供核验使用的 AI 详情 PDF。它们只读取本地证据，不会代替参赛队生成提交文件，也不会把支撑材料或 AI 记录加入训练语料。未使用 AI 时不传 `--ai-details`，但论文仍须包含官方规定的未使用声明；使用 AI 时，详情文件还须按官方名称放入正式支撑材料。缺少适用材料会得到 `UNKNOWN`，不会被推定为合规。
 
 ## 2026 规则与判定边界
